@@ -1,0 +1,14 @@
+l1 = ["apple", "banana", "apple", "cherry", "banana", "apple", "date", "cherry", "banana", "date"]
+unique_list = list(set(l1))
+l = len(l1)
+k = 0
+count = 0
+values = []
+for i in unique_list:
+    while k<l:
+        if i == l1[k]:
+            count+=1
+        k+=1
+    values.append(count)
+
+print(dict(zip(unique_list, values)))

@@ -1,0 +1,20 @@
+#fname = input("enter the file name: ")
+file = open("/Users/viveksingh/digital/python/python_projects/python_codes/file.txt")
+#inp = file.read()
+#print(inp[:70000])
+for line in file:
+    line = line.strip()
+    if line.startswith("*"):
+        print(line)
+file.close()
+
+list1 = ["A", "B", "C", "D", "E"]
+list2 = ["1", "2", "3", "4", "5"]   
+str1 = ",".join(str(x) for x in list1)
+str2 = ",".join(str(x) for x in list2)
+print(str1)
+print(list1 + list2)
+f = list1 + list2
+print(f)
+print(str2)
+str1 = str1.rep

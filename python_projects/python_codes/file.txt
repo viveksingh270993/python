@@ -1,0 +1,1664 @@
+
+
+
+Claude finished the response
+
+rlc retransmission----in as much depth as possible also possible interview questions and answers on it, no pdf
+
+
+RLC Retransmission — Deep Dive
+1. Where RLC Sits
+RLC (Radio Link Control) is a Layer-2 sublayer in the LTE and 5G NR user-plane and control-plane stack:
+PDCP → RLC → MAC → PHY
+It exists per-radio-bearer (one RLC entity per DRB/SRB direction) and operates in one of three modes:
+* TM (Transparent Mode) — no header, no SN, no retransmission. Used for BCCH, PCCH, CCCH.
+* UM (Unacknowledged Mode) — sequence numbering + reordering, but no retransmission. Used for delay-sensitive bearers like VoLTE/VoNR voice.
+* AM (Acknowledged Mode) — full ARQ with retransmission, in-order delivery, duplicate detection. Used for SRBs and most DRBs.
+Retransmission only exists in AM mode. Everything below is about RLC AM.
+
+2. Why RLC Retransmission Exists When HARQ Already Does Retransmission
+This is the most-asked conceptual question. The short answer: HARQ is fast but unreliable; RLC is slow but reliable.
+Layer	Mechanism	Latency	Residual BLER
+MAC HARQ	Stop-and-wait, Chase combining / IR	~4–8 ms	~10⁻¹ to 10⁻²
+RLC ARQ	Selective Repeat, status-driven	tens of ms	~10⁻⁵ to 10⁻⁶
+HARQ uses 1-bit ACK/NACK on PUCCH/PDCCH with very tight timing — it's fast but the ACK/NACK itself can be flipped (NACK→ACK in particular causes data loss). HARQ is also limited to a small number of retransmissions (typically up to 4). Anything HARQ fails to recover is left for RLC ARQ to clean up. RLC operates over richer feedback (STATUS PDUs) and can recover from those residual losses.
+
+3. RLC AM Header and PDU Structure
+An AMD PDU (AM Data PDU) carries:
+* D/C — Data (1) or Control (0) PDU
+* P — Polling bit (request a STATUS PDU from peer)
+* SI (Segmentation Info) — 2 bits in NR: 00 = complete SDU, 01 = first segment, 10 = last segment, 11 = middle segment
+* SN (Sequence Number) — 12-bit or 18-bit in NR (10-bit in LTE for short, 16-bit for extended)
+* SO (Segment Offset) — only present when PDU is a segment; indicates byte offset within the original SDU
+A STATUS PDU (Control PDU) carries:
+* CPT = 000 (STATUS PDU type)
+* ACK_SN — next SN the receiver expects (everything below is implicitly ACKed unless explicitly NACKed)
+* NACK_SN list — each entry is an SN missing or partially received; may carry SOstart/SOend for partial NACKs (segment-level) and an optional NACK_range field
+
+4. State Variables (NR naming)
+Sender side:
+* TX_Next_Ack — next SN expected to be acknowledged (lower edge of TX window)
+* TX_Next — next SN to be assigned to a new SDU
+* POLL_SN — SN of the most recent PDU that triggered a poll
+* PDU_WITHOUT_POLL — counter for pollPDU trigger
+* BYTE_WITHOUT_POLL — counter for pollByte trigger
+* RETX_COUNT — per-SN retransmission count
+Receiver side:
+* RX_Next — earliest SN still awaited (lower edge of RX window)
+* RX_Next_Highest — highest SN+1 ever received
+* RX_Next_Status_Trigger — SN that triggered t-Reassembly
+* RX_Highest_Status — highest SN that can be included as ACK_SN in next STATUS
+The AM transmit window spans from TX_Next_Ack to TX_Next_Ack + AM_Window_Size. If TX_Next would exceed the upper edge, the window stalls — this itself is a polling trigger.
+
+5. The Retransmission Trigger Path
+A retransmission happens in two main flows:
+Flow A — Receiver detects a gap and reports it
+1. Receiver gets PDUs out of order; e.g., gets SN=5,7 but missing SN=6.
+2. Receiver starts t-Reassembly when it sees the gap (and t-Reassembly is not already running).
+3. When SN=6 arrives within t-Reassembly, gap closes. If t-Reassembly expires first, receiver concludes SN=6 is lost and updates RX_Highest_Status / RX_Next_Status_Trigger to trigger a STATUS report.
+4. Receiver builds a STATUS PDU with ACK_SN=8 and NACK_SN=6 (possibly with SOstart/SOend if only part of SN=6 was missing).
+5. STATUS PDU sent on the reverse RLC entity (it's a control PDU on the same logical channel).
+Flow B — Sender polls and waits
+    * Sender sets the P bit on a transmitted PDU when:
+    * PDU_WITHOUT_POLL ≥ pollPDU, or
+    * BYTE_WITHOUT_POLL ≥ pollByte, or
+    * It's the last PDU in the transmission buffer and no new SDU is available, or
+    * Window is stalling.
+1. Sender records POLL_SN = TX_Next − 1 and starts t-PollRetransmit.
+2. Receiver, on seeing P=1, schedules a STATUS PDU (subject to t-StatusProhibit which rate-limits STATUS PDUs).
+    * If t-PollRetransmit expires before STATUS arrives covering POLL_SN, sender considers the polled PDU lost and:
+    * Retransmits the PDU with SN = POLL_SN (or another unacknowledged PDU if POLL_SN is already ACKed), or
+    * Polls again on a fresh PDU.
+What the sender does on receiving STATUS
+* All SNs < ACK_SN that are not NACKed → considered delivered → remove from retx buffer, slide TX_Next_Ack.
+* All NACKed SNs → place into retransmission buffer, increment RETX_COUNT for each.
+* If RETX_COUNT for any SN reaches maxRetxThreshold, RLC tells RRC, which declares RLF (Radio Link Failure) → connection re-establishment.
+
+6. Re-segmentation
+When a PDU needs retransmission but the MAC grant is smaller than the original PDU size, RLC can split the PDU into multiple segments. Each segment carries the same SN but different SO (Segment Offset). The SI field marks first/middle/last segment.
+* NR allows segmenting both original and retransmitted PDUs (via SI + SO).
+* LTE had a separate AMD PDU Segment format for re-segmentation; NR unified this.
+* Status feedback can ACK/NACK at segment granularity using SOstart/SOend.
+
+7. Key Timers and Parameters (configured by RRC)
+Parameter	Purpose
+t-PollRetransmit	Sender waits this long after polling; on expiry, retransmits/repolls.
+t-Reassembly	Receiver waits this long for a gap to close before declaring loss.
+t-StatusProhibit	Receiver won't send another STATUS until this expires; prevents storm.
+pollPDU	Number of PDUs after which to set P=1.
+pollByte	Number of bytes after which to set P=1.
+maxRetxThreshold	Max RLC retransmissions before declaring failure. Typical values: 4, 8, 16, 32.
+sn-FieldLength	12 or 18 bits in NR.
+8. LTE vs NR RLC — Quick Diff
+* NR RLC has no concatenation — MAC does the concat. This simplifies RLC and lets MAC pack on demand without waiting for RLC.
+* NR delivers SDUs out-of-order to PDCP (PDCP handles reordering); LTE RLC delivered in-order.
+* NR SN sizes: 12 or 18 bits (UM and AM); LTE had 5/10 (UM) and 10/16 (AM).
+* NR removed the LTE AMD PDU Segment format; uses SI+SO uniformly.
+
+9. Failure Mode: What Triggers RLF From RLC
+When any SN in the retransmission buffer hits RETX_COUNT == maxRetxThreshold:
+1. RLC notifies upper layer (RRC).
+2. RRC declares Radio Link Failure.
+3. UE goes to RRC_IDLE or attempts RRC Re-establishment.
+4. All RLC entities are re-established (state variables reset, buffers flushed except in some handover cases).
+
+Interview Questions and Answers
+Q1. Why do we need RLC retransmission when MAC HARQ already retransmits? HARQ is fast but uses a single-bit ACK/NACK that can itself be misinterpreted (especially NACK-to-ACK errors, ~10⁻³). HARQ also has a limited number of attempts. The result is a residual BLER of ~10⁻²–10⁻¹ after HARQ, which is unacceptable for TCP/IP traffic. RLC ARQ uses richer STATUS feedback to detect and recover those residual losses, achieving 10⁻⁵–10⁻⁶ BLER. They're complementary: HARQ for speed, RLC for reliability.
+Q2. In which RLC mode does retransmission happen? Only in AM (Acknowledged Mode). TM has no header at all. UM has SN and reordering but no retransmission — used for VoLTE/VoNR where late packets are worthless.
+Q3. What triggers a polling bit (P=1) in RLC? Four triggers: (a) pollPDU counter reaches threshold, (b) pollByte counter reaches threshold, (c) the PDU is the last in the transmission buffer with no new SDU available, (d) the AM transmit window has stalled.
+Q4. What is t-PollRetransmit and when does it expire? A sender-side timer started when a poll is sent. If a STATUS PDU covering POLL_SN doesn't arrive before it expires, the sender assumes the poll or the polled PDU was lost, and re-polls (either by retransmitting the unacknowledged PDU or by setting P=1 on a fresh PDU).
+Q5. What is t-Reassembly? A receiver-side timer. Started when a gap appears in the received SN sequence. If the missing SN arrives in time, the timer is stopped. If it expires, the receiver concludes the missing PDU is lost and updates state to include it in the next STATUS report as a NACK.
+Q6. What is t-StatusProhibit? A receiver-side timer that throttles how often STATUS PDUs can be sent. After sending a STATUS, the receiver cannot send another until this timer expires. Prevents a flood of STATUS PDUs eating uplink resources.
+Q7. What is maxRetxThreshold and what happens when it's reached? The maximum number of times RLC will retransmit a single SN. When any SN's RETX_COUNT equals this value, RLC indicates the failure to RRC, which declares Radio Link Failure and starts the re-establishment procedure.
+Q8. Walk me through what happens when the sender receives a STATUS PDU. The sender (i) advances TX_Next_Ack up to ACK_SN, removing acknowledged PDUs from the retransmission buffer; (ii) for each NACK_SN, marks that PDU (or segment, if SOstart/SOend are present) for retransmission and increments its RETX_COUNT; (iii) if any RETX_COUNT exceeds maxRetxThreshold, signals failure to RRC; (iv) on the next transmission opportunity, retransmits the NACKed PDUs, possibly re-segmenting them if the MAC grant is smaller than the original PDU.
+Q9. What is re-segmentation? When a PDU needs retransmission but the available MAC grant is smaller than the original PDU, RLC splits it into segments. Each segment carries the same SN, different SO (segment offset), and an SI field indicating first/middle/last segment. The receiver reassembles them by SN+SO.
+Q10. How does the receiver tell the sender about a partially received PDU? The STATUS PDU's NACK_SN entry can carry SOstart and SOend fields, indicating which byte range of that SN is still missing. The sender only retransmits the missing portion.
+Q11. What's the difference between ACK_SN and NACK_SN in a STATUS PDU? ACK_SN is the next SN the receiver expects — it's a cumulative ACK, meaning every SN below ACK_SN is implicitly acknowledged except those listed as NACK_SN. NACK_SNs are the gaps.
+Q12. Difference between LTE and NR RLC? NR removed concatenation (moved to MAC), delivers PDUs out-of-order to PDCP (PDCP reorders), unified the segmentation format using SI+SO (LTE had a separate AMD PDU Segment), and uses 12/18-bit SN. NR RLC is simpler and supports lower latency because MAC can pack on demand without waiting for RLC concatenation.
+Q13. What is window stalling and how is it handled? The AM transmit window is TX_Next_Ack to TX_Next_Ack + AM_Window_Size. If TX_Next reaches the upper edge, the sender cannot transmit new SDUs and is stalled. This itself triggers a poll (P=1) so the receiver responds with a STATUS, hopefully advancing TX_Next_Ack and freeing the window.
+Q14. What happens if a STATUS PDU itself is lost? The STATUS PDU is not acknowledged — it's a control PDU. But the sender's t-PollRetransmit will expire (because no STATUS arrived covering POLL_SN), causing it to re-poll. The next STATUS will carry the full ACK/NACK picture again, since it's stateless from the receiver's perspective.
+Q15. Can RLC duplicate detection happen in UM? UM has SN and a reception window, so it can drop duplicates that fall outside the window or are reordered. But because there's no retransmission, duplicates in UM are rare (only happen via lower-layer anomalies).
+Q16. Where does RLF declaration ultimately come from? RRC declares RLF, but RLC's maxRetxThreshold exceedance is one of the triggers (along with T310 expiry from PHY out-of-sync indication, random-access failure, etc.). RLC just signals "I gave up on this SN" to RRC.
+Q17. Why is HARQ ACK/NACK not enough — give a numerical example. HARQ NACK-to-ACK error probability is roughly 10⁻³. After 4 HARQ attempts each with target 10% initial BLER, the residual is ~10⁻⁴ from missed packets but ~10⁻³ from misinterpreted NACK→ACK (the sender thinks it got through, doesn't retransmit, packet is lost). TCP starts seeing trouble around 10⁻⁵. RLC closes that gap.
+Q18. How does the sender decide which PDU to retransmit first when multiple are NACKed? Generally in SN order, but the actual transmission is gated by MAC grant size. If a grant is small, the sender may pick a smaller PDU (or a segment of a larger one) that fits. The exact selection is implementation-specific within the standard's constraints.
+Q19. What's the relationship between RLC SN and PDCP SN? They're independent. PDCP SN sits in the PDCP header (12/18-bit) for PDCP-level duplicate detection, reordering, and ciphering. RLC SN is for RLC-level ARQ. A single PDCP PDU becomes one RLC SDU, which gets its own RLC SN (or multiple if segmented).
+Q20. In NR, why is in-order delivery moved to PDCP? To reduce latency. With out-of-order delivery from RLC, PDCP can decipher and forward PDUs as they arrive instead of waiting for the missing SN. PDCP, which already does reordering for handover, absorbs the in-order responsibility. This shaves milliseconds off end-to-end latency for URLLC use cases.
+
+Want me to do the same kind of deep-dive on a related topic next — HARQ, PDCP duplication/reordering, MAC scheduling, or handover-time RLC behavior?
+
+
+
+comparison in table for tcp and udp
+
+
+TCP vs UDP — Comparison
+Aspect	TCP (Transmission Control Protocol)	UDP (User Datagram Protocol)
+Connection	Connection-oriented (3-way handshake before data)	Connectionless (no handshake, just send)
+Reliability	Reliable — guarantees delivery via ACKs & retransmission	Unreliable — no delivery guarantee, fire-and-forget
+Ordering	In-order delivery (sequence numbers reorder packets)	No ordering — packets may arrive out of order
+Error handling	Detects loss, retransmits lost segments	Checksum only detects corruption; no recovery
+Flow control	Yes — sliding window (receiver advertises window size)	None
+Congestion control	Yes — slow start, congestion avoidance, fast retransmit/recovery	None
+Header size	20–60 bytes (variable, with options)	8 bytes (fixed)
+Header fields	Seq no, ACK no, window, flags, checksum, etc.	Source port, dest port, length, checksum
+Speed/latency	Slower — overhead from handshake, ACKs, ordering	Faster — minimal overhead, low latency
+Data boundaries	Byte stream (no message boundaries preserved)	Message/datagram-based (boundaries preserved)
+Connection state	Maintains state at both ends	Stateless
+Acknowledgements	Yes	No
+Handshake	SYN → SYN-ACK → ACK (and FIN-based teardown)	None
+Multicast/Broadcast	No (unicast only)	Yes — supports broadcast & multicast
+Overhead	High	Low
+Use cases	Web (HTTP/HTTPS), email (SMTP), file transfer (FTP), SSH	DNS, VoIP, video/audio streaming, online gaming, DHCP, SNMP
+Quick mental model
+TCP = a phone call: you establish a connection, confirm the other side is listening, and both sides acknowledge what's said. Reliable but with setup cost.
+UDP = sending postcards: you drop them in the mailbox and hope they arrive. No confirmation, but fast and cheap.
+Interview-relevant notes
+The key trade-off is reliability vs. latency. Choose TCP when every byte must arrive correctly and in order (a corrupted file is useless). Choose UDP when timeliness beats completeness — in a live voice call, a packet that arrives 500 ms late is worse than one that never arrives, so you'd rather drop it and move on.
+A common follow-up: "Why does DNS use UDP?" — Because a query/response is tiny (fits one datagram), and the cost of a TCP handshake would dominate the actual data transfer. DNS does fall back to TCP for large responses (e.g., zone transfers or responses exceeding 512 bytes / EDNS limits).
+Another: "HTTP/3 uses UDP — why?" — QUIC runs over UDP but rebuilds reliability, ordering, and congestion control in user space, avoiding TCP's head-of-line blocking and enabling faster connection setup (0-RTT/1-RTT).
+Want me to add a similar deep-dive on the TCP 3-way handshake, congestion control algorithms, or QUIC/HTTP3 next?
+
+
+
+throughput calculation in 5g
+
+
+5G NR Throughput Calculation
+The 3GPP Formula (TS 38.306)
+The approximate peak data rate (in Mbps) is:
+
+                 J
+Data Rate = 10⁻⁶ · Σ [ v_Layers⁽ʲ⁾ · Qm⁽ʲ⁾ · f⁽ʲ⁾ · Rmax · (N_PRB⁽ʲ⁾ · 12 / Ts⁽ʲ⁾) · (1 − OH⁽ʲ⁾) ]
+                j=1
+Each term is one aggregated component carrier; you sum across all J carriers.
+What Each Parameter Means
+Symbol	Meaning	Typical values
+J	Number of aggregated carriers (CA)	1, 2, 3…
+v_Layers	Number of MIMO spatial layers	1, 2, 4, 8
+Qm	Modulation order (bits/symbol)	QPSK=2, 16QAM=4, 64QAM=6, 256QAM=8
+f	Scaling factor	1, 0.8, 0.75, 0.4
+Rmax	Max code rate	948/1024 = 0.92578
+N_PRB	Number of PRBs for the bandwidth + numerology	e.g. 273 for 100 MHz @ 30 kHz
+12	Subcarriers per PRB	fixed
+Ts	Average OFDM symbol duration (s)	10⁻³ / (14 · 2^μ)
+OH	Overhead fraction	see below
+10⁻⁶	Converts bits/s → Mbps	fixed
+Overhead values (OH)
+Band	Direction	OH
+FR1 (sub-6 GHz)	Downlink	0.14
+FR1	Uplink	0.18
+FR2 (mmWave)	Downlink	0.08
+FR2	Uplink	0.10
+Numerology (μ) and symbol duration
+μ	SCS	Slots/ms	Ts = 10⁻³/(14·2^μ)
+0	15 kHz	1	71.4 µs
+1	30 kHz	2	35.7 µs
+2	60 kHz	4	17.9 µs
+3	120 kHz	8	8.93 µs
+The term (N_PRB · 12 / Ts) is simply resource elements per second — total subcarriers divided by symbol time.
+
+Worked Example
+Scenario: FR1, single carrier, 100 MHz, 30 kHz SCS (μ=1), 256QAM, 4 MIMO layers, downlink.
+Parameters:
+* v_Layers = 4
+* Qm = 8 (256QAM)
+* f = 1
+* Rmax = 0.92578
+* N_PRB = 273 (100 MHz @ 30 kHz)
+* Ts = 35.71 µs → 1/Ts = 28,000
+* OH = 0.14 (FR1 DL)
+Step by step:
+
+REs/sec      = 273 · 12 · 28,000          = 91,728,000
+bits/symbol  = 4 · 8 · 0.92578             = 29.625
+raw bits/sec = 29.625 · 91,728,000         = 2,717,442,000
+after OH     = × (1 − 0.14)                = 2,336,999,000
+in Mbps      = × 10⁻⁶                      ≈ 2337 Mbps
+Result ≈ 2.34 Gbps for a single 100 MHz 4×4 256QAM carrier — matching published 5G FR1 peak figures.
+To reach the headline "10 Gbps" numbers you aggregate carriers (CA), add more MIMO layers (e.g. 8), or use FR2's wider bandwidths (up to 400 MHz/carrier).
+
+Common PRB Counts (handy reference)
+Bandwidth	15 kHz	30 kHz	60 kHz
+20 MHz	106	51	24
+50 MHz	270	133	65
+100 MHz	—	273	135
+400 MHz (FR2, 120 kHz)	—	—	264
+Interview Questions and Answers
+Q1. Walk me through the 5G throughput formula. Throughput = number of MIMO layers × modulation order × code rate × resource elements per second × (1 − overhead), summed over all aggregated carriers, scaled to Mbps. The resource-elements-per-second term is N_PRB × 12 / Ts. Each factor maps to a physical concept: layers = spatial multiplexing, Qm = bits per symbol, Rmax = coding efficiency, RE/s = time-frequency resources, OH = control/reference signal overhead.
+Q2. What is Rmax and why 948/1024? Rmax is the maximum channel code rate supported, 948/1024 ≈ 0.926. It's the highest MCS entry in the NR MCS tables — the closest you get to sending uncoded data while still having some protection. It's a fixed constant in the peak-rate formula.
+Q3. Why does higher numerology (larger SCS) not necessarily increase throughput? Larger SCS means shorter symbol duration (more symbols/sec), but also wider subcarriers, so fewer PRBs fit in the same bandwidth. The two effects roughly cancel — N_PRB × 12 / Ts stays similar for a given bandwidth. Higher numerology mainly helps latency (shorter slots) and phase-noise robustness at mmWave, not raw peak throughput.
+Q4. What is the scaling factor f? A UE-reported capability factor (1, 0.8, 0.75, or 0.4) that de-rates the theoretical peak based on what the device can actually sustain across its supported band combinations. It accounts for practical UE processing limits.
+Q5. Why is uplink overhead higher than downlink? UL has additional control overhead — SRS (sounding reference signals), more DMRS configurations, and PUCCH resources — so OH is 0.18 (UL) vs 0.14 (DL) in FR1.
+Q6. How do you get to 10+ Gbps peak rates? Combine levers: carrier aggregation (multiple 100 MHz carriers), higher-order MIMO (8 layers DL), 256QAM (or 1024QAM in later releases), and FR2 wide bandwidths (400 MHz). E.g., 2 carriers × 100 MHz × 4 layers × 256QAM ≈ 4.6 Gbps; scale up layers/carriers from there.
+Q7. Difference between FR1 and FR2 in this calc? FR2 (mmWave) uses higher numerologies (60/120 kHz), supports wider bandwidths per carrier (up to 400 MHz), and has lower overhead values (0.08 DL / 0.10 FR2). But it suffers higher path loss, so peak rates are achievable only at short range.
+Q8. What's the difference between peak throughput and actual user throughput? This formula gives the theoretical peak assuming best-case SINR, max MCS, all PRBs allocated to one user, no retransmissions. Real throughput is lower due to: shared resources among users (scheduling), lower MCS at cell edge, HARQ/RLC retransmissions, control overhead, TDD UL/DL split, and channel conditions. A useful follow-up is that TDD configuration (e.g. DDDSU patterns) directly cuts effective throughput by the fraction of slots assigned to that direction.
+Q9. How does TDD slot configuration affect throughput? In TDD, DL and UL share the same band in time. If only 7 of 10 slots are downlink, peak DL throughput is roughly 70% of the full-duplex calculation. You multiply the result by the DL (or UL) duty-cycle fraction.
+Q10. Why multiply by 12 in the formula? Each PRB (Physical Resource Block) is defined as 12 subcarriers in the frequency domain. So N_PRB × 12 gives total subcarriers, and dividing by symbol duration gives resource elements per second.
+Want me to cover MCS tables and how SINR maps to throughput, TDD frame structure, or carrier aggregation next?
+
+
+
+yes
+
+
+I'll cover all three areas you'd want next — MCS/SINR mapping, TDD frame structure, and carrier aggregation — in the same interview-prep style.
+
+Part 1 — MCS Tables and SINR → Throughput Mapping
+What MCS Is
+MCS (Modulation and Coding Scheme) is a single index that bundles together modulation order (Qm) and target code rate (R). The gNB scheduler picks an MCS per user per transmission based on reported channel quality. A higher MCS = more bits per symbol = higher throughput, but needs a better (higher SINR) channel to decode reliably.
+The Feedback Loop (CQI → MCS)
+
+UE measures SINR  →  maps to CQI (0–15)  →  reports CQI on PUCCH/PUSCH
+                          ↓
+gNB picks MCS  →  adjusts via outer-loop link adaptation (target ~10% BLER)
+                          ↓
+transmits  →  HARQ ACK/NACK feeds back  →  nudges MCS up/down
+* CQI (Channel Quality Indicator, 4-bit, 0–15) is what the UE reports.
+* MCS (5-bit, 0–31 usable) is what the gNB actually schedules.
+* The gNB uses outer-loop link adaptation (OLLA): it offsets the SINR estimate based on HARQ ACK/NACK history to hold a ~10% initial BLER target.
+NR MCS Tables (TS 38.214)
+There are three main DL MCS tables, selected by RRC:
+Table	Max modulation	Use case
+Table 1	64QAM (Qm=6)	Baseline
+Table 2	256QAM (Qm=8)	Good channels, peak rates
+Table 3	64QAM, low spectral efficiency	URLLC / cell edge (very robust, low code rates)
+Each table maps MCS index → (Qm, target code rate R, spectral efficiency).
+Representative CQI → Modulation → Efficiency (Table 1)
+CQI	Modulation	Code rate ×1024	Efficiency (bits/RE)	Rough SINR
+1	QPSK	78	0.15	< −4 dB
+4	QPSK	308	0.60	~0 dB
+7	16QAM	378	1.48	~5 dB
+9	16QAM	616	2.41	~9 dB
+11	64QAM	466	2.73	~12 dB
+13	64QAM	772	4.52	~17 dB
+15	64QAM	948	5.55	~20+ dB
+(With 256QAM tables, CQI 15 reaches ~7.4 bits/RE.)
+How SINR Drives the Throughput Number
+The link between the throughput formula and SINR is the Qm × R product (spectral efficiency). Low SINR forces low Qm and low R → fewer bits/RE → lower throughput. The Shannon ceiling is log₂(1+SINR) bits/Hz; real systems sit a few dB below it due to implementation loss.
+Worked intuition: At 100 MHz / 30 kHz (273 PRBs), you have ~91.7M REs/sec. At cell edge (QPSK, R≈0.15 → 0.3 bits/RE) you get ~27 Mbps per layer. At cell center (256QAM, R≈0.93 → 7.4 bits/RE) you get ~680 Mbps per layer. Same resources, 25× difference — purely SINR-driven.
+
+Part 2 — TDD Frame Structure
+Frame Hierarchy
+
+1 Frame = 10 ms
+ └─ 10 Subframes × 1 ms each
+     └─ each subframe = 2^μ slots
+         └─ each slot = 14 OFDM symbols (normal CP)
+μ	SCS	Slots/subframe	Slot duration
+0	15 kHz	1	1 ms
+1	30 kHz	2	0.5 ms
+2	60 kHz	4	0.25 ms
+3	120 kHz	8	0.125 ms
+Slot Types and the Special Slot
+In TDD, each slot is Downlink (D), Uplink (U), or Special/Flexible (S). The special slot contains:
+* DL symbols (continued downlink),
+* a Guard Period (GP) — empty time for the UE to switch from RX→TX and for propagation delay,
+* UL symbols (start of uplink).
+The guard period sets the maximum cell radius: longer GP = larger cell but less usable data time.
+Common TDD Patterns
+Notation like DDDSU means 3 DL slots, 1 special, 1 UL, repeating.
+Pattern	DL:UL ratio	Typical use
+DDDSU	~4:1	Common mid-band, DL-heavy
+DDDDDDDSUU	7:2	Very DL-heavy (eMBB)
+DSUUU	UL-heavy	Uplink-centric (uncommon)
+Why TDD Matters for Throughput
+In TDD, DL and UL time-share the same frequency. If a DDDSU pattern gives ~3.5 of 5 slots to DL (counting partial special slot), peak DL is roughly 70% of the full formula result. So:
+
+Effective DL throughput = (formula peak) × (DL slot fraction)
+This is why a "2.34 Gbps" FR1 peak becomes ~1.6 Gbps in a real DDDSU deployment.
+Interview-relevant TDD points
+* DL/UL configuration must be aligned across neighboring cells to avoid cross-link interference (a DL transmission in one cell hitting a UL reception in another).
+* Latency vs throughput trade-off: more frequent UL slots reduce UL latency but cut DL throughput.
+* TDD is dominant in 5G mid-band (n78, 3.5 GHz) because of abundant unpaired spectrum; FDD is still used in low bands.
+
+Part 3 — Carrier Aggregation (CA)
+Concept
+CA combines multiple component carriers (CCs) to give one UE more total bandwidth. Each CC behaves like its own carrier (own HARQ, own PRBs); the throughput formula sums across them (Σ from j=1 to J).
+
+Total throughput = CC1 + CC2 + ... + CCn
+CA Types
+Type	Description
+Intra-band contiguous	CCs adjacent in the same band
+Intra-band non-contiguous	CCs in the same band but with a gap
+Inter-band	CCs in different bands (e.g. n78 + n28)
+Key CA Concepts
+* PCell (Primary Cell): carries RRC signaling, handles connection/mobility. Always present.
+* SCell (Secondary Cell): added/removed dynamically for extra throughput. Activated via MAC CE.
+* Cross-carrier scheduling: PDCCH on one CC can schedule data on another (useful if one CC has interference on its control region).
+NR-Specific: Aggregation Flavors
+* CA (Carrier Aggregation): multiple CCs within the same gNB/cell group, one MAC entity.
+* Dual Connectivity (DC): UE connected to two nodes (e.g. EN-DC = LTE eNB + NR gNB in NSA 5G), two MAC entities. The classic non-standalone 5G launch mode.
+* Supplementary Uplink (SUL): a lower-band UL paired with a high-band TDD carrier to extend UL coverage.
+Throughput Example with CA
+3× 100 MHz carriers, each 4×4 256QAM @ 30 kHz (from the earlier 2.34 Gbps single-carrier result):
+
+Total ≈ 3 × 2.34 Gbps ≈ 7.0 Gbps (DL peak, before TDD scaling)
+Add 8 layers or a 4th carrier and you cross 10 Gbps.
+Interview Questions (CA + TDD + MCS combined)
+Q1. How does the gNB decide which MCS to use? It maps the UE's reported CQI to an MCS, then applies outer-loop link adaptation using HARQ ACK/NACK feedback to maintain ~10% initial BLER. Good channel → high MCS → high throughput.
+Q2. Why are there separate MCS tables for 256QAM and URLLC? The 256QAM table unlocks higher peak efficiency in good channels. The low-spectral-efficiency (URLLC) table provides very low code rates and robust modulation for ultra-reliable, low-BLER (10⁻⁵) transmission at the cost of throughput.
+Q3. What limits cell size in TDD? The guard period in the special slot. It must cover the UE RX→TX switching time plus round-trip propagation delay. A larger cell needs a longer GP, which reduces usable data symbols.
+Q4. Why does TDD reduce peak throughput vs the raw formula? Because DL and UL share time on the same frequency. Effective throughput = formula peak × (fraction of slots in that direction). A DDDSU pattern gives roughly 70–80% to DL.
+Q5. Difference between Carrier Aggregation and Dual Connectivity? CA aggregates carriers under a single MAC/scheduler (same node). DC connects the UE to two nodes with separate MAC entities, used in NSA 5G (EN-DC: LTE anchor + NR). CA needs tight coordination; DC tolerates non-ideal backhaul between nodes.
+Q6. What's the role of PCell vs SCell? PCell handles RRC signaling, security, and mobility — it's always there. SCells add bandwidth for throughput and can be activated/deactivated quickly via MAC control elements based on traffic demand.
+Q7. How do MCS, MIMO layers, and CA combine to reach 5G peak rates? They're multiplicative/additive levers in the formula: MCS sets bits/RE (Qm×R), MIMO layers multiply that by spatial streams, and CA sums across carriers. Stacking 256QAM + 8 layers + multiple 100 MHz carriers is how you reach multi-gigabit peaks.
+
+That completes the trio. The natural next topics from here would be MIMO/beamforming (SU-MIMO vs MU-MIMO, codebooks, CSI feedback), HARQ operation in detail, or the 5G NR initial access procedure (SSB, RACH, RRC setup). Want any of those?
+
+
+
+link adaptation
+
+
+Link Adaptation in 5G NR
+What It Is
+Link adaptation (LA) is the gNB's continuous process of matching the transmission parameters — modulation, code rate, MIMO rank, and power — to the instantaneous radio channel quality of each user. The goal: send as many bits as the channel can reliably carry, no more, no less.
+The core trade-off: a high MCS pushes more bits/symbol but needs high SINR to decode; a low MCS is robust but wastes capacity in good conditions. LA keeps the system at the sweet spot, typically targeting ~10% initial Block Error Rate (BLER).
+Why 10% and not 0%? Because the residual errors are cheaply recovered by HARQ retransmissions, and operating at 10% BLER maximizes net throughput. Targeting 0% would force an overly conservative MCS and leave capacity on the table.
+
+The Two Adaptation Loops
+Link adaptation runs as two nested control loops:
+
+            ┌─────────── OUTER LOOP (slow) ───────────┐
+            │  HARQ ACK/NACK history → SINR offset     │
+            │  corrects CQI bias, holds 10% BLER       │
+            └──────────────────┬──────────────────────┘
+                               ↓ applies offset to
+            ┌─────────── INNER LOOP (fast) ───────────┐
+            │  CQI report → effective SINR → pick MCS  │
+            └──────────────────────────────────────────┘
+Inner-Loop Link Adaptation (ILLA)
+Fast, CQI-driven. The UE measures the channel (via CSI-RS), maps it to a CQI (0–15), and reports it. The gNB translates CQI → effective SINR → an MCS index. This reacts quickly but relies on the accuracy of the UE's report.
+Outer-Loop Link Adaptation (OLLA)
+Slow, HARQ-driven. The CQI report is often biased (UE implementation, aging reports, interference fluctuation). OLLA watches the actual HARQ ACK/NACK stream and applies a dynamic SINR offset (Δ):
+
+On NACK:  Δ ← Δ − step_down   (be more conservative)
+On ACK:   Δ ← Δ + step_up     (be more aggressive)
+The step sizes are chosen so the long-run BLER converges to the target. A common rule: with target BLER = 10%, set step_up / step_down = BLER / (1 − BLER) = 0.1/0.9. So one NACK pushes down hard, nine ACKs nudge back up — balancing to 10%.
+The OLLA offset is applied to the SINR derived from CQI before MCS selection. This corrects systematic bias that the inner loop alone can't see.
+
+What Gets Adapted
+Link adaptation isn't only MCS — the gNB tunes several knobs together:
+Knob	What it does	Driven by
+Modulation (Qm)	QPSK → 16/64/256QAM	SINR
+Code rate (R)	More/less FEC redundancy	SINR
+MCS index	Bundles Qm + R	CQI + OLLA offset
+MIMO rank	Number of spatial layers	RI (Rank Indicator)
+Precoding	Beam/codebook selection	PMI (Precoding Matrix Indicator)
+Power control	TX power per channel	path loss, interference
+BWP / PRB allocation	How much bandwidth	scheduler + buffer
+The CSI Feedback Triad
+The UE reports Channel State Information that feeds link adaptation:
+* CQI (Channel Quality Indicator) — recommended modulation+code rate for ≤10% BLER.
+* RI (Rank Indicator) — how many MIMO layers the channel can support.
+* PMI (Precoding Matrix Indicator) — which precoder/beam best matches the channel.
+These are measured from CSI-RS (downlink) and reported on PUCCH (periodic) or PUSCH (aperiodic, triggered by DCI). For uplink LA, the gNB uses SRS (Sounding Reference Signals) from the UE to estimate the UL channel directly.
+
+Interaction with HARQ
+Link adaptation and HARQ are tightly coupled:
+* LA sets the initial transmission MCS at ~10% BLER.
+* HARQ recovers the ~10% that fail, via retransmissions with soft combining (Chase / Incremental Redundancy).
+* HARQ ACK/NACK is also the feedback signal that drives OLLA.
+So HARQ both cleans up LA's deliberate 10% error rate and informs LA's future decisions. This is why you operate at 10% rather than 0% — the combination of aggressive LA + HARQ maximizes net spectral efficiency.
+
+Fast vs Slow Adaptation Context
+* Fast fading (small-scale): handled by frequent CQI reporting and per-slot scheduling. In high-mobility, CQI ages quickly and becomes unreliable — the gNB compensates with larger OLLA margins (more conservative MCS).
+* Slow fading (path loss, shadowing): handled by power control and rank/BWP adaptation over longer timescales.
+
+Interview Questions and Answers
+Q1. What is link adaptation and why is it needed? It's the dynamic matching of transmission parameters (modulation, code rate, MIMO rank, power) to the channel quality of each user. It's needed because the radio channel varies constantly with distance, fading, mobility, and interference; using a fixed scheme would either waste capacity in good conditions or fail to decode in bad ones.
+Q2. Explain inner-loop vs outer-loop link adaptation. Inner loop (ILLA) is fast and CQI-driven: it maps the UE's reported CQI to an MCS each scheduling opportunity. Outer loop (OLLA) is slower and HARQ-driven: it applies an SINR offset based on ACK/NACK history to correct systematic CQI bias and hold the BLER at its target. ILLA reacts to channel changes; OLLA corrects the inaccuracy of the feedback itself.
+Q3. Why target 10% BLER instead of 0%? Because HARQ cheaply recovers those errors via retransmission. Operating at 10% lets the gNB use a more aggressive MCS, and the net throughput (after HARQ recovery) is higher than if it conservatively targeted near-zero errors. It's a deliberate, optimized error rate.
+Q4. How does OLLA adjust the operating point? It maintains a dynamic SINR offset. Each NACK decreases the offset (more conservative MCS), each ACK increases it (more aggressive). The step ratio is set so the long-run BLER converges to target — e.g. for 10% target, the up-step is roughly 1/9 of the down-step, so one NACK is balanced by nine ACKs.
+Q5. What's the difference between CQI and MCS? CQI is the 4-bit channel quality the UE reports (its recommendation). MCS is the 5-bit scheme the gNB actually schedules. The gNB converts CQI to an effective SINR, applies the OLLA offset, then selects the MCS. They're related but not identical — the gNB can override the UE's recommendation.
+Q6. What are RI and PMI, and how do they fit into link adaptation? RI (Rank Indicator) tells the gNB how many MIMO layers the channel supports — adapting rank is part of LA. PMI (Precoding Matrix Indicator) recommends the best precoder/beam. Together with CQI, they let the gNB adapt not just modulation/coding but also spatial multiplexing and beamforming.
+Q7. How does link adaptation work for uplink? The gNB estimates the UL channel directly from the UE's SRS (Sounding Reference Signals) rather than relying on UE-reported CQI. It then assigns the UL MCS and grant. OLLA still applies using UL HARQ feedback.
+Q8. Why does high UE mobility degrade link adaptation? Fast fading makes CQI reports stale by the time they're acted on — the channel has already changed (Doppler-induced). This causes mismatched MCS and higher errors. The gNB compensates by being more conservative (larger margin / lower MCS) and may report CQI more frequently, trading peak throughput for reliability.
+Q9. How are link adaptation and HARQ related? LA sets the initial MCS at ~10% BLER; HARQ recovers the failures via soft-combined retransmissions. Crucially, HARQ ACK/NACK is also the feedback that drives OLLA. So they're a coupled system: LA deliberately tolerates errors that HARQ fixes, and HARQ's outcomes tune LA.
+Q10. What can the gNB adapt besides MCS? MIMO rank (number of layers), precoding/beam (PMI), transmit power (power control), and the bandwidth/PRB allocation and BWP. Full link adaptation is multi-dimensional, not just modulation and coding.
+Q11. What inputs does the link adaptation algorithm use? Downlink: CSI feedback (CQI/RI/PMI) measured from CSI-RS, plus HARQ ACK/NACK history. Uplink: SRS-based channel estimates plus UL HARQ feedback. Both also factor in interference measurements and the UE's buffer/QoS requirements.
+Q12. What happens if CQI reporting is too infrequent? The MCS decisions lag the real channel, increasing mismatch and either errors (too aggressive) or wasted capacity (too conservative). OLLA partially compensates by widening margins, but responsiveness suffers — a trade-off between CQI signaling overhead and adaptation accuracy.
+
+Natural next topics: HARQ in detail (soft combining, IR vs Chase, HARQ process IDs), CSI framework (CSI-RS, reporting modes, Type I/II codebooks), or power control (open-loop vs closed-loop). Want one of those?
+
+
+
+cell anmd ue kpis parameters values definations etc
+
+
+5G/LTE Cell & UE KPIs — Definitions, Parameters, Value Ranges
+I'll split this into UE-level RF measurements (what a device measures on the air interface) and network/cell-level KPIs (what an operator tracks for performance).
+
+Part 1 — UE-Level RF Measurement Parameters
+These are the signal-quality metrics the UE measures and reports. Memorize the value ranges — they're the most common interview drill.
+RSRP (Reference Signal Received Power)
+* Definition: Average power received over the reference signal resource elements (per RE), in dBm. In 5G, measured on SS-RSRP (SSB) or CSI-RSRP. In LTE, on CRS.
+* Formula concept: linear average of power contributions of REs carrying the reference signal, within the measurement bandwidth.
+* Purpose: Coverage/signal strength; used for cell selection, reselection, and handover decisions.
+Quality	RSRP (dBm)
+Excellent	≥ −80
+Good	−80 to −90
+Fair / mid-cell	−90 to −100
+Poor / cell edge	−100 to −110
+Very poor / no service	< −110 (−120 = near unusable)
+Range: roughly −44 dBm to −140 dBm.
+RSRQ (Reference Signal Received Quality)
+* Definition: RSRQ = N × RSRP / RSSI, where N = number of PRBs over which RSSI is measured. Indicates quality (signal vs interference+load), in dB.
+* Purpose: Captures interference and loading, not just strength. Falls in busy/interfered cells even if RSRP is good.
+Quality	RSRQ (dB)
+Excellent	≥ −10
+Good	−10 to −15
+Fair	−15 to −18
+Poor	< −20
+Range: roughly −3 dB to −19.5 dB (LTE); 5G allows wider.
+SINR (Signal-to-Interference-plus-Noise Ratio)
+* Definition: Ratio of wanted signal power to (interference + noise) power, in dB. Directly drives achievable MCS and throughput.
+* Purpose: Best predictor of throughput/data quality.
+Quality	SINR (dB)	Typical result
+Excellent	≥ 20	256QAM, max throughput
+Good	13 to 20	64QAM
+Fair	0 to 13	16QAM/QPSK
+Poor	< 0	QPSK, edge, retransmissions
+Range: roughly −20 dB to +30 dB.
+RSSI (Received Signal Strength Indicator)
+* Definition: Total wideband received power (dBm) = serving signal + interference + noise + all RBs. Not reported directly in NR but used inside RSRQ.
+* Note: RSSI alone can't distinguish wanted signal from noise — that's why RSRP/RSRQ/SINR exist.
+CQI / RI / PMI (CSI feedback)
+Param	Range	Meaning
+CQI	0–15	Channel quality → recommended modulation+code rate (15 = best)
+RI	1–8	Rank Indicator → number of MIMO layers channel supports
+PMI	codebook index	Precoding Matrix Indicator → best beam/precoder
+Quick relationship
+
+RSRP   = how strong the signal is (power)
+RSSI   = total power (signal + interference + noise)
+RSRQ   = quality, factors in load/interference  [≈ N·RSRP/RSSI]
+SINR   = signal vs interference+noise → predicts throughput
+CQI    = UE's recommendation derived from SINR
+A useful interview point: you can have strong RSRP but poor SINR (high interference from neighbors), which is why a phone shows "full bars" but slow data.
+
+Part 2 — Network / Cell-Level KPIs
+Operators group these into the classic categories: Accessibility, Retainability, Mobility, Integrity, Availability, Traffic/Utilization.
+A. Accessibility KPIs (Can the user get on the network?)
+KPI	Definition	Target
+RRC Setup Success Rate	Successful RRC connection setups ÷ attempts	> 99%
+RACH Success Rate	Successful random-access procedures ÷ attempts	> 98%
+NSA/SA Registration Success	Successful registrations ÷ attempts	> 99%
+PDU Session Est. Success Rate	Successful PDU session establishments ÷ attempts (5G)	> 98%
+ERAB / DRB Setup Success Rate	Successful bearer setups ÷ attempts	> 99%
+Accessibility (composite)	RRC × S1/NG signaling × ERAB success	> 98%
+B. Retainability KPIs (Does the connection stay up?)
+KPI	Definition	Target
+Call/Session Drop Rate	Abnormal releases ÷ total established	< 1–2%
+RRC Connection Drop Rate	Abnormal RRC releases ÷ established	< 1%
+DRB Retainability	Abnormal DRB releases per unit traffic	low
+Service Drop Rate (VoLTE/VoNR)	Dropped voice sessions ÷ established	< 0.5%
+C. Mobility KPIs (Handover performance)
+KPI	Definition	Target
+Handover Success Rate (HOSR)	Successful HOs ÷ HO attempts	> 98%
+Intra-freq HO Success	Same-frequency HO success	> 98%
+Inter-freq HO Success	Cross-frequency HO success	> 97%
+Inter-RAT HO Success	E.g., 5G→LTE / LTE→3G	> 95%
+HO Ping-pong Rate	HO back to source within short time	low (< 3%)
+Reestablishment Success Rate	Successful RRC re-establishments after failure	high
+D. Integrity KPIs (Quality of service delivered)
+KPI	Definition	Typical target
+DL/UL Cell Throughput	Aggregate cell data rate	depends on BW/load
+DL/UL User Throughput	Per-user perceived rate	scenario-dependent
+Latency (U-plane)	Packet delay (RTT/one-way)	< 10 ms (eMBB), < 1 ms (URLLC)
+Packet Loss Rate	Lost packets ÷ total	< 0.1–1%
+BLER (Block Error Rate)	Errored blocks ÷ total (after HARQ ~target)	initial ~10%, residual < 1%
+Jitter	Variation in packet delay	low (voice/video)
+Spectral Efficiency	bits/s/Hz	depends on MCS/MIMO
+E. Availability KPIs (Is the cell up?)
+KPI	Definition	Target
+Cell Availability	Time cell is operational ÷ total time	> 99.9%
+Radio Network Availability	Composite across cells/sites	> 99.9%
+F. Traffic / Utilization KPIs
+KPI	Definition
+PRB Utilization (DL/UL)	Used PRBs ÷ available PRBs (load indicator)
+Active Users / Connected Users	RRC-connected UE count per cell
+Data Volume (DL/UL)	Bytes transferred (GB)
+PDCP/SDU Volume	Throughput at PDCP layer
+CCE Utilization	PDCCH control channel load
+Paging Load	Paging messages per second
+How They Connect (interview synthesis)
+
+RF measurements (RSRP/RSRQ/SINR)
+        ↓ determine
+Link adaptation & MCS
+        ↓ produce
+Integrity KPIs (throughput, BLER, latency)
+        ↓ poor RF also hurts
+Accessibility & Retainability (access fails, drops)
+        ↓ during movement
+Mobility KPIs (handover success)
+Root-cause logic operators use: low SINR → low CQI/MCS → low throughput (integrity) and high BLER; if RF degrades badly → RRC drops (retainability) or HO failures (mobility).
+
+Interview Questions and Answers
+Q1. Difference between RSRP, RSRQ, and SINR? RSRP is signal strength (power per reference RE, dBm) — pure coverage. RSRQ is signal quality incorporating load/interference (≈ N·RSRP/RSSI, dB). SINR is the ratio of wanted signal to interference+noise (dB) — it best predicts throughput. You can have good RSRP but bad SINR in a high-interference cell.
+Q2. Why might a phone show full signal bars but slow data? Bars are usually based on RSRP (strength), but throughput depends on SINR. Strong neighbor-cell interference or heavy cell load lowers SINR/RSRQ while RSRP stays high — so strong signal, poor data rate.
+Q3. What's a typical good RSRP and SINR for cell-center vs edge? Cell center: RSRP ≥ −80 dBm, SINR ≥ 20 dB (supports 256QAM). Cell edge: RSRP −100 to −110 dBm, SINR near 0 dB or below (QPSK, low throughput, more retransmissions).
+Q4. What are the main KPI categories operators track? Accessibility (can you connect — RRC/RACH/setup success), Retainability (does it stay — drop rates), Mobility (handover success), Integrity (throughput, latency, BLER, packet loss), Availability (cell uptime), and Traffic/Utilization (PRB usage, active users, data volume).
+Q5. What is BLER and what's the target? Block Error Rate = errored transport blocks ÷ total. Link adaptation targets ~10% initial BLER (recovered by HARQ), with residual BLER after HARQ/RLC well under 1%. It's a deliberate operating point that maximizes net throughput.
+Q6. How is RSRQ calculated? RSRQ = N × RSRP / RSSI, where N is the number of PRBs over which RSSI (total wideband power) is measured. It reflects quality including interference and load, not just strength.
+Q7. What is PRB utilization and why does it matter? The fraction of available Physical Resource Blocks in use. It's the key load/congestion indicator — high PRB utilization means the cell is congested, which lowers per-user throughput and can degrade accessibility (blocking) and integrity KPIs.
+Q8. What's an acceptable handover success rate, and what causes failures? Typically > 98%. Failures stem from late/wrong handover triggers (poor mobility parameter tuning), weak target-cell coverage, missing neighbor relations, or interference at the boundary. Ping-pong (rapid back-and-forth) is a related quality issue from poorly set hysteresis/time-to-trigger.
+Q9. How do RF metrics relate to network KPIs? RF metrics are the root cause layer: SINR drives CQI→MCS→throughput (integrity KPIs). Degraded RF causes failed access (accessibility), dropped connections (retainability), and handover failures (mobility). Operators trace KPI degradation back to RF measurements during optimization.
+Q10. What's the difference between cell throughput and user throughput? Cell throughput is the aggregate rate across all users sharing the cell. User throughput is what a single user perceives — lower, because resources are shared and the user may be at a worse SINR than the cell average. A cell can have high aggregate throughput while edge users see poor individual rates.
+Q11. What KPIs matter most for VoLTE/VoNR? Retainability (voice drop rate < 0.5%), latency and jitter (voice is delay-sensitive), packet loss, and accessibility (call setup success). Throughput matters less since voice is low-bitrate; integrity is about delay/jitter, not data rate.
+Q12. What is cell availability and its typical target? The percentage of time a cell is operational and carrying traffic, target > 99.9%. It's an availability KPI; downtime comes from hardware faults, transport failures, or maintenance.
+
+Want me to go deeper on any category — e.g. handover/mobility procedures and parameters (A1–A5/B1–B2 events, hysteresis, TTT), how to root-cause a low-throughput complaint using these KPIs, or the RRC/RACH access procedure that underlies the accessibility KPIs?
+
+
+
+low throughput
+
+
+Low Throughput — Root Cause Analysis & Troubleshooting
+This is one of the most common real-world optimization problems and a favorite interview scenario: "A user/cell is seeing low throughput — how do you troubleshoot it?" The key is a structured, layer-by-layer approach rather than guessing.
+
+The Throughput Equation as a Diagnostic Map
+Recall the throughput drivers. Anything that reduces one of these factors reduces throughput:
+
+Throughput ∝ Bandwidth(PRBs) × MIMO layers × MCS(Qm × R) × (1−overhead) × scheduling share × (1−BLER)
+So low throughput traces back to one or more of:
+1. Few PRBs allocated → congestion / scheduling
+2. Low MIMO rank → poor channel / antenna issue
+3. Low MCS → poor SINR (the most common cause)
+4. High BLER / retransmissions → interference, poor RF
+5. Low scheduling share → cell load, QoS priority
+6. Non-radio bottleneck → transport, core, server, or device
+
+The Structured Troubleshooting Funnel
+Work top-down, isolating where the bottleneck is:
+
+1. Is it the DEVICE / APPLICATION?      (single user only?)
+2. Is it RADIO (RF/SINR)?                (low MCS, high BLER)
+3. Is it CONGESTION (load)?              (high PRB util, many users)
+4. Is it TRANSPORT / BACKHAUL?           (cell-wide ceiling)
+5. Is it CORE / EXTERNAL (server/internet)? (TCP, peering)
+Step 1 — Scope it: one user or the whole cell?
+* One user only → likely device, RF location, or application/server.
+* Whole cell / all users → congestion, transport, or configuration.
+* Many cells / region → core, transport aggregation, or external.
+This single question eliminates half the search space.
+
+Cause Category 1 — Radio / RF (the most common)
+Low SINR → low CQI → low MCS → low throughput. Symptoms and checks:
+Symptom	Likely cause	Check
+Low RSRP (< −110 dBm)	Coverage hole, cell edge, distance	Drive test / UE measurement
+Good RSRP, low SINR	Interference (intra/inter-cell), overshooting	RSRQ, SINR, neighbor cells
+Low CQI / low MCS	Poor channel quality	CQI/MCS distribution stats
+High BLER	Interference, fast fading, bad MCS	BLER counters, HARQ stats
+Low MIMO rank (RI=1)	Poor scattering, LOS, antenna fault	RI reports, MIMO config
+Common RF root causes:
+* Coverage limited — UE too far / indoor penetration loss → weak RSRP. Fix: power, tilt, new site, repeaters.
+* Interference limited — strong neighbor signals (PCI confusion, overshooting, overlap) → good RSRP but poor SINR. Fix: tilt/azimuth optimization, power adjustment, ICIC/interference coordination.
+* Low rank — channel can't support multiple MIMO layers (line-of-sight or correlated antennas) → fewer spatial streams.
+
+Cause Category 2 — Congestion / Load
+The cell is healthy but oversubscribed — resources shared among too many users.
+Indicator	Meaning
+High PRB utilization (> 70–80%)	Cell running out of resources
+High active/connected user count	Many users competing
+High CCE/PDCCH utilization	Control channel exhausted (can't schedule)
+Per-user throughput low, cell throughput high	Classic congestion signature
+Fixes: carrier aggregation / add carrier, load balancing to neighbor cells or other frequencies, cell split/densification, traffic steering, QoS prioritization.
+
+Cause Category 3 — Configuration Issues
+Issue	Effect
+Limited bandwidth / BWP configured	Caps PRBs available
+Carrier aggregation not activated	Single carrier only
+MIMO not enabled / wrong mode	Fewer layers
+256QAM not enabled	Caps modulation at 64QAM
+TDD config too UL-heavy	Limits DL slots
+Wrong MCS table selected	Caps spectral efficiency
+Restrictive scheduler / QoS profile	Low resource share
+These are "free" gains — fixing config doesn't need new hardware.
+
+Cause Category 4 — Transport / Backhaul
+The radio is fine but the backhaul link caps the cell.
+* Symptom: cell throughput plateaus at a fixed ceiling regardless of RF quality or user count (e.g., always maxes at ~1 Gbps because the backhaul is 1 Gbps).
+* Check: transport link capacity vs cell aggregate demand; transport utilization counters; latency on the backhaul.
+* Fix: upgrade backhaul (fiber, higher-capacity microwave).
+
+Cause Category 5 — Core / External / Device
+Layer	Possible cause
+Device (UE)	Old chipset (no CA/256QAM/high MIMO), thermal throttling, low category, single-band
+TCP behavior	TCP slow start, small window, packet loss triggering congestion control
+Core network	UPF/SGW-U bottleneck, QoS/AMBR rate limiting, GTP tunnel issues
+Internet / server	Distant or throttled server, peering congestion, server-side limits
+Key insight: A speed test to a nearby server vs a distant one isolates whether the bottleneck is in the access network or beyond it. TCP throughput is also limited by Window / RTT — high latency caps TCP throughput even on a fast link (bandwidth-delay product).
+
+The TCP / Latency Trap (frequently asked)
+Even with great radio, TCP throughput is bounded by:
+
+Max TCP throughput = TCP Window Size / RTT
+So high RTT (latency) or a small receive window throttles throughput regardless of available radio capacity. A single lost packet also triggers TCP congestion control, halving the window. This is why "the radio looks fine but throughput is low" — the bottleneck is the transport-layer protocol, not the air interface.
+
+Practical Diagnostic Checklist
+
+□ Single user or cell-wide?           → scope the problem
+□ RSRP / RSRQ / SINR values?          → coverage vs interference
+□ CQI / MCS distribution?             → link adaptation health
+□ BLER / HARQ retransmission rate?    → error level
+□ MIMO rank (RI)?                     → spatial multiplexing
+□ PRB utilization & user count?       → congestion
+□ Bandwidth / CA / 256QAM / MIMO config? → configuration gaps
+□ TDD DL/UL ratio?                    → slot allocation
+□ Transport link utilization?         → backhaul ceiling
+□ Speed test near vs far server?      → access vs core/external
+□ UE category & capabilities?         → device limit
+
+Interview Questions and Answers
+Q1. A customer complains of slow data. How do you troubleshoot it? First scope it: is it one user or the whole cell? Then work down the stack — check RF (RSRP/RSRQ/SINR/CQI/MCS), then BLER/retransmissions, then cell congestion (PRB utilization, user count), then configuration (bandwidth, CA, MIMO, 256QAM), then transport/backhaul, then core/device/server. The structured funnel isolates the bottleneck instead of guessing.
+Q2. RSRP is strong but throughput is low. What's wrong? Strong RSRP rules out coverage; the issue is likely interference (low SINR/RSRQ) from neighbor cells or overshooting, congestion (high PRB utilization), a configuration limit (no CA/256QAM/MIMO), or a non-radio bottleneck like transport or TCP. Check SINR and RSRQ first — if they're poor despite good RSRP, it's interference or load.
+Q3. How do you distinguish a coverage problem from an interference problem? Coverage-limited: low RSRP and low SINR — fix with power/tilt/new sites. Interference-limited: good RSRP but low SINR/RSRQ — fix with antenna tilt/azimuth optimization, power control, or interference coordination. The RSRP-vs-SINR relationship is the discriminator.
+Q4. Cell throughput is high but each user is slow. Why? Classic congestion. The cell is fully utilized (high PRB utilization, many active users) and resources are shared, so per-user throughput drops even though aggregate is high. Fixes: add carrier/CA, load balance, densify, or apply QoS prioritization.
+Q5. The radio looks perfect but throughput is still capped. Where do you look? Beyond the air interface: transport/backhaul ceiling (cell plateaus at a fixed rate), core network rate limiting (AMBR/QoS), device limitations (UE category, no CA/256QAM), or TCP/server behavior. Run a near-server speed test to separate access from external bottlenecks.
+Q6. How can latency limit throughput even on a fast link? TCP throughput ≈ window size / RTT (bandwidth-delay product). High RTT or a small receive window caps throughput regardless of available bandwidth. Packet loss also triggers TCP congestion control, shrinking the window. So a high-latency or lossy path throttles TCP even when the radio is fast.
+Q7. What configuration gaps commonly cause low throughput? 256QAM not enabled (caps modulation), carrier aggregation not activated (single carrier), MIMO disabled or low order (fewer layers), narrow bandwidth/BWP (few PRBs), UL-heavy TDD config (fewer DL slots), or a restrictive scheduler/QoS profile. These are fixable without new hardware.
+Q8. How does low MIMO rank cause low throughput, and what causes low rank? Each MIMO layer is a parallel data stream; rank = number of usable layers. Low rank (RI=1) means no spatial multiplexing — throughput multiplier of 1 instead of 2/4/8. Causes: strong line-of-sight (correlated channel), poor scattering environment, antenna correlation/faults, or low SINR forcing rank fallback.
+Q9. What's the relationship between SINR and throughput? SINR determines the highest reliable MCS (Qm × code rate). Low SINR forces QPSK with low code rate (few bits/RE); high SINR enables 256QAM with high code rate (many bits/RE) — easily a 20×+ difference for the same resources. SINR is the single strongest predictor of per-user throughput.
+Q10. How does high BLER reduce throughput? High initial BLER means many transport blocks fail and need HARQ retransmissions. Retransmissions consume resources without delivering new data, lowering effective throughput. It usually signals too-aggressive MCS for the channel (link adaptation mismatch) or genuine interference/fast fading.
+Q11. A whole region of cells shows low throughput. Where do you look first? Region-wide rules out single-cell RF; look at shared infrastructure — transport aggregation, the core network (UPF/gateway congestion), or an external/peering issue. Configuration pushed network-wide (a bad parameter template) is also a candidate.
+Q12. What's the fastest single question to narrow a low-throughput issue? "Is it one user or everyone in the cell?" One user → RF location, device, or application/server. Everyone → congestion, configuration, or transport. This immediately halves the diagnostic space before any counter analysis.
+
+That rounds out the throughput troubleshooting picture. From here the natural deep-dives are handover/mobility events (A1–A5, B1–B2, hysteresis, TTT), interference management (ICIC/CoMP/beamforming), or the RACH/RRC access procedure. Want one?
+
+
+
+vonr kpis
+
+
+VoNR (Voice over New Radio) KPIs
+VoNR is native 5G voice — voice carried as packets over the 5G NR radio and the IMS core, without falling back to LTE. The KPIs follow the same families as general network KPIs (accessibility, retainability, integrity, mobility) but specialized for a real-time, delay-sensitive, conversational service.
+
+Foundations You Need First (interviewers probe these)
+* VoNR rides on a dedicated QoS Flow with 5QI = 1 (GBR, delay-critical) for the voice media, plus 5QI = 5 for IMS signaling (SIP). It maps to a dedicated DRB.
+* IMS (IP Multimedia Subsystem) handles call control via SIP; media flows as RTP/UDP.
+* Codecs: AMR-NB, AMR-WB, and EVS (Enhanced Voice Services — the premium HD codec for VoNR/VoLTE).
+* EPS Fallback: if VoNR isn't supported/available, the 5G network redirects the voice call to LTE (VoLTE). EPS Fallback success/latency is itself a key VoNR-era KPI.
+* Why special handling: voice is low-bitrate (~5.9–24 kbps) but extremely sensitive to delay, jitter, and packet loss, not throughput.
+
+A. Accessibility KPIs (Can the call be set up?)
+KPI	Definition	Target
+VoNR Call Setup Success Rate (CSSR)	Successful call setups ÷ attempts	> 98–99%
+IMS Registration Success Rate	Successful IMS/SIP registrations ÷ attempts	> 99%
+Dedicated Bearer / QoS Flow (5QI=1) Setup Success	Successful voice QoS flow setups ÷ attempts	> 99%
+SIP Invite Success Rate	Successful INVITE transactions ÷ attempts	> 98%
+Call Setup Time (CST)	Time from dial to ringing/answer	< ~2–4 s
+Post-Dial Delay (PDD)	Time from send to ringback heard	low (< few seconds)
+B. Retainability KPIs (Does the call stay up?)
+KPI	Definition	Target
+VoNR Call Drop Rate (CDR)	Abnormally released calls ÷ established	< 0.5–1%
+Voice QoS Flow Retainability	Abnormal 5QI=1 flow releases per traffic	low
+Call Completion Rate	Calls completed normally ÷ established	high
+C. Integrity / Voice Quality KPIs (How good does it sound?)
+This is where VoNR differs most from data KPIs — quality is about delay and loss, not data rate.
+KPI	Definition	Target
+MOS (Mean Opinion Score)	Perceived voice quality, scale 1–5	> 3.5 (good); EVS HD can reach ~4+
+Packet Loss Rate	Lost RTP packets ÷ total	< 1% (ideally < 0.5%)
+Jitter	Variation in packet inter-arrival time	< 20–30 ms
+One-way / Mouth-to-Ear Delay	End-to-end voice latency	< 150 ms (good), < 250 ms acceptable
+RTP Packet Delay	Air-interface + transport delay for media	low
+Residual BLER (voice DRB)	Errored blocks after HARQ on voice bearer	very low (< 1%)
+MOS scale reference:
+MOS	Quality
+4.3–5.0	Excellent (HD / EVS)
+4.0–4.3	Good
+3.6–4.0	Fair
+3.1–3.6	Poor
+< 3.1	Bad / unacceptable
+D. Mobility KPIs (Voice continuity while moving)
+KPI	Definition	Target
+VoNR Handover Success Rate	Successful HOs during active call ÷ attempts	> 98%
+EPS Fallback Success Rate	Successful redirections of voice to LTE ÷ attempts	> 98%
+EPS Fallback Setup Delay	Added delay from the fallback procedure	minimized
+SRVCC Success Rate	Single Radio Voice Call Continuity (5G/LTE → legacy) success	> 95%
+Inter-RAT HO during call	Voice continuity across RATs	high
+E. Capacity / Utilization KPIs
+KPI	Definition
+VoNR Erlang / Traffic	Voice traffic volume
+Simultaneous VoNR Users	Concurrent active voice sessions per cell
+VoNR PRB Utilization	Resources consumed by voice flows
+How VoNR Quality Degrades (root-cause logic)
+
+Poor RF (low SINR) → high BLER on voice DRB → HARQ retx → added delay + packet loss
+        ↓                                              ↓
+   call drops (retainability)              jitter ↑, MOS ↓ (integrity)
+
+Congestion → scheduling delay for 5QI=1 flow → jitter/delay → MOS ↓
+Mobility → handover interruption → packet loss burst → MOS dip / drop
+Because voice is GBR (5QI=1), the scheduler prioritizes it — so VoNR quality holds up under load better than best-effort data, but it's very sensitive to delay/jitter introduced anywhere in the chain.
+
+Interview Questions and Answers
+Q1. What is VoNR and how does it differ from VoLTE? VoNR is native voice over the 5G NR radio with the IMS core — voice as packets directly on 5G. VoLTE is the same concept on LTE (4G). VoNR avoids the latency and complexity of falling back to LTE for calls. Both use IMS/SIP for control and RTP for media; the difference is the access RAT (5G NR vs LTE).
+Q2. What QoS flow / 5QI does VoNR voice use? The voice media uses 5QI = 1, a GBR (Guaranteed Bit Rate), delay-critical flow mapped to a dedicated DRB. IMS signaling (SIP) uses 5QI = 5 (non-GBR). The GBR treatment ensures the scheduler prioritizes voice even under congestion.
+Q3. What is EPS Fallback and why does it matter as a KPI? When VoNR can't be served (network/device doesn't support it in that area), the 5G network redirects the voice call to LTE (VoLTE). EPS Fallback Success Rate and the added setup delay are critical KPIs during early 5G deployment, because most networks fall back rather than carrying VoNR end-to-end. High fallback rate or delay means poor voice experience on 5G.
+Q4. Which KPIs define VoNR voice quality? MOS (1–5 perceived quality), packet loss rate (< 1%), jitter (< 20–30 ms), and one-way mouth-to-ear delay (< 150 ms ideal). Voice quality is about delay and loss, not throughput, because the codec bitrate is tiny.
+Q5. What is MOS and what's a good value? Mean Opinion Score, 1–5, quantifying perceived voice quality (can be subjective or estimated via models like POLQA/E-model). Above 3.5 is good; EVS HD voice can reach ~4.0–4.5. Below ~3.1 is unacceptable.
+Q6. Why is voice sensitive to jitter and delay but not throughput? Voice codecs use very low bitrate (a few kbps), so bandwidth is never the constraint. But voice is real-time and conversational — packets arriving late (delay) or unevenly (jitter) cause gaps, robotic audio, or talk-over. Beyond ~150 ms one-way delay, conversation feels unnatural; jitter beyond the de-jitter buffer causes dropped audio.
+Q7. What codecs does VoNR use? AMR-NB, AMR-WB, and primarily EVS (Enhanced Voice Services) for HD voice. EVS offers better quality at the same or lower bitrate and is robust to packet loss, making it the preferred VoNR codec.
+Q8. How does poor RF affect VoNR? Low SINR raises BLER on the voice DRB, triggering HARQ retransmissions that add delay and can cause packet loss — degrading MOS and jitter. Severe RF degradation drops the call (retainability) or triggers handover/fallback. Because 5QI=1 is GBR-prioritized, scheduling delay is less of an issue than raw RF quality.
+Q9. What accessibility KPIs matter for VoNR? Call Setup Success Rate, IMS registration success, dedicated 5QI=1 QoS flow setup success, SIP INVITE success, and call setup time / post-dial delay. If IMS registration or the dedicated bearer setup fails, the call never starts.
+Q10. What is SRVCC and how does it relate to VoNR? Single Radio Voice Call Continuity hands an active packet voice call over to legacy circuit-switched (or LTE) when the user moves out of 5G/IMS coverage. SRVCC success rate is a mobility KPI ensuring calls don't drop at coverage boundaries. In modern deployments EPS Fallback handles much of this at call setup, while SRVCC handles mid-call transitions to legacy.
+Q11. A user reports choppy/robotic VoNR audio. How do you troubleshoot? Check integrity KPIs first: packet loss and jitter on the voice flow, and one-way delay. Choppy audio usually means packet loss or excessive jitter overwhelming the de-jitter buffer. Trace back to RF (low SINR → BLER → loss), congestion (scheduling delay), or transport/IMS jitter. Confirm codec (EVS robustness) and check handover events for loss bursts during mobility.
+Q12. What's the target one-way delay for acceptable voice, and why? Under ~150 ms one-way (mouth-to-ear) is good per ITU-T G.114; up to ~250 ms is acceptable. Beyond that, conversational interactivity degrades — people talk over each other and perceive lag. This budget covers air interface, transport, core, and de-jitter buffering combined.
+Q13. How does congestion affect VoNR differently than data? Because VoNR uses GBR 5QI=1, the scheduler reserves and prioritizes its resources, so it degrades more gracefully than best-effort data under load. However, severe congestion still adds scheduling delay and jitter, lowering MOS. Admission control may also block new GBR voice flows (raising call setup failures) to protect existing calls.
+
+That covers the VoNR KPI landscape. Natural follow-ups: EPS Fallback call flow in detail, the VoNR/IMS registration and call-setup signaling (SIP/SDP), or QoS flow → DRB mapping and 5QI table. Want one of those?
+
+
+
+5 tm500 testcase for l2 testing
+
+
+5 TM500 Test Cases for L2 (MAC / RLC / PDCP) Testing
+Quick context: the TM500 is a UE emulator (Viavi/Cobham) used to load- and protocol-test an eNB/gNB. For L2 testing you exercise the MAC, RLC, and PDCP sublayers — scheduling, HARQ, ARQ, segmentation, multiplexing, flow control. Below are five structured test cases in a standard format you can drop into a test plan.
+
+TC-01 — DL Peak Throughput / MAC Scheduling Verification
+Field	Detail
+Objective	Verify the gNB/eNB schedules maximum MCS and full PRB allocation to achieve peak DL L2 throughput under ideal radio conditions.
+Layer	MAC (scheduling, MCS selection, PRB allocation)
+Preconditions	TM500 emulating 1 UE in RRC_CONNECTED; clean RF (high SINR via attenuator set low); full DL buffer (saturated traffic source).
+Configuration	Single UE, max layers (e.g. 4×4 MIMO), 256QAM enabled, full bandwidth (e.g. 100 MHz @ 30 kHz = 273 PRBs), TDD pattern noted (e.g. DDDSU).
+Procedure	1. Attach UE, establish DRB. 2. Inject saturating DL traffic from core/test source. 3. Run for fixed duration (e.g. 60 s). 4. Capture MAC-layer throughput, MCS distribution, PRB utilization.
+Expected Result	gNB allocates near-full PRBs, schedules MCS index near max (256QAM, Rmax), DL MAC throughput approaches theoretical peak (scaled by TDD ratio).
+Pass Criteria	DL L2 throughput ≥ X% (e.g. 90%) of theoretical peak; MCS at/near max; PRB utilization ~100%.
+KPIs Measured	DL MAC throughput (Mbps), MCS distribution, PRB utilization, BLER.
+TC-02 — RLC AM Retransmission (ARQ) Under Induced Errors
+Field	Detail
+Objective	Verify RLC AM correctly detects lost PDUs and recovers them via ARQ (STATUS PDU / NACK → retransmission) without data loss.
+Layer	RLC AM (ARQ, STATUS reporting, polling)
+Preconditions	UE connected on an AM DRB; ability to induce errors (TM500 error injection or controlled RF degradation via fading/attenuation).
+Configuration	RLC AM mode; configure t-PollRetransmit, t-Reassembly, t-StatusProhibit, maxRetxThreshold per spec; known SDU stream with sequence tracking.
+Procedure	1. Establish AM DRB, start known traffic pattern. 2. Induce a target residual error rate (e.g. force HARQ failures / drop PDUs). 3. Capture RLC STATUS PDUs (ACK_SN / NACK_SN). 4. Verify NACKed PDUs are retransmitted and reassembled in order. 5. Confirm no SDU loss at the receiver and no duplicates delivered to PDCP.
+Expected Result	Receiver issues STATUS PDUs with correct NACK_SN; sender retransmits NACKed SNs (re-segmenting if grant smaller); all SDUs delivered in order, zero loss.
+Pass Criteria	0% SDU loss; correct STATUS/NACK behavior; retransmissions occur within timer bounds; no RLF unless errors exceed maxRetxThreshold (negative case).
+KPIs Measured	RLC retransmission count, STATUS PDU rate, SDU loss = 0, reordering correctness, residual BLER post-ARQ.
+TC-03 — HARQ Retransmission & BLER Target Verification
+Field	Detail
+Objective	Verify MAC HARQ recovers transport-block errors and that link adaptation holds the ~10% initial BLER target.
+Layer	MAC HARQ + link adaptation
+Preconditions	UE connected; controllable RF (fading profile / attenuation to set a target SINR).
+Configuration	Enable HARQ (max retx e.g. 4); set RF for moderate SINR; saturated DL traffic; capture HARQ ACK/NACK and per-process stats.
+Procedure	1. Set channel to a target SINR. 2. Run saturated DL traffic. 3. Capture initial-transmission BLER, residual BLER after HARQ, HARQ retransmission distribution, and MCS adaptation behavior.
+Expected Result	Initial BLER converges near ~10% (OLLA target); HARQ retransmissions recover most failures; residual BLER < 1%; MCS adapts to channel.
+Pass Criteria	Initial BLER within target window (e.g. 8–12%); residual BLER < 1%; HARQ retransmission rate consistent with channel; soft combining gain observed.
+KPIs Measured	Initial BLER, residual BLER, HARQ retx count/distribution, MCS distribution, throughput vs SINR.
+TC-04 — Logical Channel Prioritization (LCP) & MAC Multiplexing
+Field	Detail
+Objective	Verify the UE-side MAC correctly multiplexes multiple logical channels into transport blocks per LCP rules (prioritized bit rate, priority order) — and the gNB grants/scheduling honor it.
+Layer	MAC (LCP, multiplexing, BSR)
+Preconditions	UE with multiple active bearers/logical channels of differing priority (e.g. one high-priority GBR + one best-effort).
+Configuration	Configure ≥2 logical channels with distinct priorities, PBR (prioritized bit rate), and bucket sizes; UL traffic on each.
+Procedure	1. Establish multiple LCs. 2. Generate UL traffic on all simultaneously. 3. Trigger BSR. 4. Capture MAC PDU composition across grants. 5. Verify higher-priority LC served first up to its PBR, then lower priority, per LCP algorithm.
+Expected Result	High-priority LC data multiplexed first up to PBR; remaining capacity shared by lower-priority LCs; BSR reflects buffer state correctly; MAC subheaders/LCIDs correct.
+Pass Criteria	Multiplexing order matches LCP rules; PBR respected; correct LCID mapping; no starvation beyond spec.
+KPIs Measured	Per-LC throughput, MAC PDU composition, BSR accuracy, grant utilization.
+TC-05 — PDCP/RLC Segmentation & Reassembly + Carrier Aggregation Throughput
+Field	Detail
+Objective	Verify correct RLC segmentation/reassembly when MAC grants are smaller than SDUs, and confirm aggregate L2 throughput scales with carrier aggregation.
+Layer	RLC (segmentation, SO/SI), MAC (CA scheduling), PDCP (reordering)
+Preconditions	UE supporting CA (PCell + ≥1 SCell); ability to vary grant sizes; large SDUs that force segmentation.
+Configuration	Activate SCell(s) via MAC CE; large PDCP SDUs; variable/limited grant sizes to force RLC segmentation; saturated traffic.
+Procedure	1. Attach UE, activate SCell(s). 2. Send large SDUs with constrained grants → forces segmentation (SI/SO usage). 3. Verify segments reassembled correctly into original SDUs. 4. Confirm aggregate throughput ≈ sum of carriers. 5. Verify PDCP in-order delivery despite out-of-order RLC.
+Expected Result	RLC segments with correct SI/SO; receiver reassembles complete SDUs (no loss/corruption); aggregate L2 throughput ≈ Σ per-carrier; PDCP reorders correctly.
+Pass Criteria	0% SDU corruption/loss; segmentation/reassembly correct; CA aggregate throughput ≥ X% of sum of carriers; PDCP delivers in order.
+KPIs Measured	Aggregate DL throughput, per-carrier throughput, RLC segmentation count, SDU integrity, PDCP reordering correctness, SCell activation success/time.
+How These Map to L2 Concepts (interview tie-in)
+* TC-01 exercises MAC scheduling & MCS — the throughput formula in practice.
+* TC-02 exercises RLC AM ARQ — the retransmission topic we covered (STATUS PDU, NACK, timers, re-segmentation).
+* TC-03 exercises MAC HARQ + link adaptation — the 10% BLER target and HARQ/ARQ interplay.
+* TC-04 exercises MAC LCP, multiplexing, BSR — how the UE packs data and reports buffer.
+* TC-05 exercises RLC segmentation, CA, PDCP reordering — the NR L2 data path end to end.
+A common interview question on this: "How do you isolate whether a failure is at MAC, RLC, or PDCP?" — Use the TM500's per-layer logs: check MAC for grant/HARQ behavior, RLC for SN gaps/STATUS/retx, and PDCP for reordering/duplicate counts. Errors that HARQ doesn't fix show up as RLC retransmissions; SDU loss surviving RLC points to PDCP or configuration.
+
+If you'd like, I can put these into a formatted test-plan document (Word or Excel matrix with columns for test ID, steps, expected, pass/fail, actual results) — just say the word and which format. Or I can expand any single test case with detailed message-level call flows and the exact TM500 logs/counters to capture.
+
+
+
+tm500 scripts for these
+
+
+Quick honest note before I generate these: the TM500's actual scripting uses a proprietary, primitive-based command set (REQ/CNF/IND style) whose exact command names and parameter syntax vary by product generation (legacy TM500 vs TM500 Network Tester) and firmware release. I don't have your specific Command Reference Manual, so I'll give you well-structured, representative scripts that capture the correct workflow, configuration blocks, and L2 parameters — but you'll need to map the exact primitive names against your TM500 command reference / TAS environment before running them in the lab.
+Let me build these as editable script files for you.
+Loaded tools
+
+Loaded tools
+
+I'll write the script file directly — it's a single focused deliverable.
+Created a file, read a file
+
+Created a file, read a file
+
+View the script file
+Each test case is a self-contained proc — TC01_dl_peak_throughput (MAC scheduling/peak DL), TC02_rlc_am_retransmission (ARQ with error injection), TC03_harq_bler_target (HARQ + 10% BLER), TC04_lcp_mac_multiplexing (LCP/BSR), TC05_segmentation_and_ca (RLC seg + CA) — plus a shared tc_common_setup and a run_all_l2_tests runner. Each ends with the KPI captures and pass criteria.
+Two things to flag honestly:
+The command primitives (SYSTEM_CONFIG_REQ, RLC_CONFIG_REQ, ERROR_INJECT_REQ, etc.) are written in a generic, illustrative TM500 style. They reflect the correct test workflow and L2 parameters, but the exact primitive names, parameter keys, and value encodings are proprietary and differ between legacy TM500, the TM500 Network Tester, and TAS/TVM automation. Before running in the lab you'll need to map each command to your actual TM500 Command Reference for your firmware release. I used .tcl since TM500 automation is commonly TCL-driven, but tell me if your environment uses a different format (TAS XML, plain command-console sequences, or Python wrappers) and I'll restructure it.
+If you tell me which TM500 variant/firmware you're on, I can tighten the syntax considerably, or expand any one test case with the full message-level call flow and the exact counters to log. Want me to do that for any of them?
+
+Tm500 l2 testcasesTCL 
+
+
+
+
+
+
+
+
+
+
+Opus uses your limit faster. Try another model for longer conversations.
+
+
+
+
+
+
+
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+
+Tm500 l2 testcases · TCL
+
+
+###############################################################################
+
+# TM500 L2 (MAC / RLC / PDCP) TEST SCRIPTS
+
+#
+
+# IMPORTANT - READ FIRST:
+
+#   These scripts are REPRESENTATIVE TEMPLATES that capture the correct TM500
+
+#   test WORKFLOW, configuration blocks, and L2 parameters. The TM500 command
+
+#   set is proprietary and PRIMITIVE/RELEASE-SPECIFIC. Exact primitive names
+
+#   (e.g. *_REQ / *_CNF / *_IND), parameter keys, and value encodings DIFFER
+
+#   between:
+
+#       - legacy TM500          (older RTC / command console)
+
+#       - TM500 Network Tester  (NT, the modern variant)
+
+#       - TAS / TVM automation wrappers
+
+#
+
+#   >>> Before running in the lab, map every command below against YOUR
+
+#   >>> TM500 Command Reference Manual for your firmware release. <<<
+
+#
+
+#   The commands here are written in a generic "send primitive + params"
+
+#   style and commented so you can translate them 1:1 to your actual syntax.
+
+#
+
+# CONVENTIONS USED IN THIS FILE:
+
+#   send <PRIMITIVE_REQ> { key=value ... }   -> issue a request primitive
+
+#   wait <PRIMITIVE_CNF>                      -> block until confirm received
+
+#   expect <PRIMITIVE_IND> { ... }           -> assert an indication/event
+
+#   log_start / log_stop                      -> per-layer logging control
+
+#   measure <metric>                          -> capture a KPI counter
+
+#   # ...                                     -> comment / placeholder
+
+###############################################################################
+
+ 
+
+ 
+
+###############################################################################
+
+# COMMON SETUP (shared by all test cases)
+
+#   Configure the system once, then each TC reuses/overrides as needed.
+
+###############################################################################
+
+proc tc_common_setup {} {
+
+ 
+
+    # --- 1. System / RAT selection -----------------------------------------
+
+    send SYSTEM_CONFIG_REQ {
+
+        rat            = NR              ;# or LTE for 4G L2 testing
+
+        duplex         = TDD
+
+        band           = n78
+
+        scs_khz        = 30             ;# numerology mu=1
+
+        channel_bw_mhz = 100            ;# -> 273 PRBs @ 30 kHz
+
+        tdd_pattern    = DDDSU
+
+    }
+
+    wait SYSTEM_CONFIG_CNF
+
+ 
+
+    # --- 2. Cell (gNB under test) parameters -------------------------------
+
+    send CELL_CONFIG_REQ {
+
+        pci            = 1
+
+        ssb_arfcn      = 632448
+
+        cell_id        = 0x01
+
+    }
+
+    wait CELL_CONFIG_CNF
+
+ 
+
+    # --- 3. Radio conditions (via internal fading/attenuation) -------------
+
+    send RF_CONDITION_REQ {
+
+        path_loss_db   = 70             ;# low PL => high SINR (clean RF)
+
+        fading_profile = NONE           ;# AWGN / static for L2 baseline
+
+    }
+
+    wait RF_CONDITION_CNF
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# TC-01  DL PEAK THROUGHPUT / MAC SCHEDULING VERIFICATION
+
+#   Goal: single UE, ideal RF, full buffer -> verify max MCS + full PRB alloc.
+
+###############################################################################
+
+proc TC01_dl_peak_throughput {} {
+
+    tc_common_setup
+
+ 
+
+    # --- UE capability: push scheduler to peak ----------------------------
+
+    send UE_CONFIG_REQ {
+
+        num_ues          = 1
+
+        mimo_layers_dl   = 4            ;# 4x4 MIMO
+
+        max_modulation   = 256QAM
+
+        ca_num_cc        = 1
+
+        ue_category      = max
+
+    }
+
+    wait UE_CONFIG_CNF
+
+ 
+
+    # --- Attach / RRC connect ---------------------------------------------
+
+    send UE_ATTACH_REQ { ue_id = 1 }
+
+    expect RRC_CONNECTED_IND { ue_id = 1 }
+
+    expect DRB_ESTABLISHED_IND { ue_id = 1 ; drb_id = 1 }
+
+ 
+
+    # --- Saturating DL data flow ------------------------------------------
+
+    send DATA_FLOW_REQ {
+
+        ue_id      = 1
+
+        direction  = DL
+
+        traffic    = FULL_BUFFER        ;# saturate to force max scheduling
+
+        l2_mode    = AM
+
+    }
+
+    wait DATA_FLOW_CNF
+
+ 
+
+    # --- Logging + run -----------------------------------------------------
+
+    log_start { layers = {MAC} ; ue_id = 1 }
+
+    send TEST_RUN_REQ { duration_s = 60 }
+
+    wait TEST_RUN_CNF
+
+    log_stop
+
+ 
+
+    # --- KPI capture -------------------------------------------------------
+
+    measure mac_dl_throughput_mbps
+
+    measure mcs_distribution_dl
+
+    measure prb_utilization_dl
+
+    measure bler_dl
+
+ 
+
+    # PASS: DL L2 thpt >= 90% theoretical peak, MCS near max, PRB ~100%
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# TC-02  RLC AM RETRANSMISSION (ARQ) UNDER INDUCED ERRORS
+
+#   Goal: force PDU loss -> verify STATUS/NACK -> retransmit -> zero SDU loss.
+
+###############################################################################
+
+proc TC02_rlc_am_retransmission {} {
+
+    tc_common_setup
+
+ 
+
+    send UE_CONFIG_REQ {
+
+        num_ues          = 1
+
+        mimo_layers_dl   = 2
+
+        max_modulation   = 64QAM
+
+    }
+
+    wait UE_CONFIG_CNF
+
+ 
+
+    # --- RLC AM timers / thresholds (per spec / your test profile) --------
+
+    send RLC_CONFIG_REQ {
+
+        ue_id              = 1
+
+        mode               = AM
+
+        sn_field_length    = 18
+
+        t_poll_retransmit  = 45         ;# ms
+
+        t_reassembly       = 50         ;# ms
+
+        t_status_prohibit  = 10         ;# ms
+
+        poll_pdu           = 64
+
+        poll_byte          = infinity
+
+        max_retx_threshold = 8
+
+    }
+
+    wait RLC_CONFIG_CNF
+
+ 
+
+    send UE_ATTACH_REQ { ue_id = 1 }
+
+    expect DRB_ESTABLISHED_IND { ue_id = 1 ; drb_id = 1 }
+
+ 
+
+    # --- Known sequenced traffic so loss/dupes are detectable -------------
+
+    send DATA_FLOW_REQ {
+
+        ue_id      = 1
+
+        direction  = DL
+
+        traffic    = SEQUENCED_PATTERN
+
+        rate_mbps  = 50
+
+        l2_mode    = AM
+
+    }
+
+    wait DATA_FLOW_CNF
+
+ 
+
+    # --- Induce errors to trigger ARQ -------------------------------------
+
+    #   Use error injection if available; else degrade RF to raise BLER.
+
+    send ERROR_INJECT_REQ {
+
+        ue_id        = 1
+
+        layer        = RLC              ;# drop PDUs at RLC, OR:
+
+        # layer      = MAC ; harq_fail_rate = 0.30   ;# force HARQ residual
+
+        pdu_loss_pct = 5
+
+    }
+
+    wait ERROR_INJECT_CNF
+
+ 
+
+    log_start { layers = {MAC, RLC} ; ue_id = 1 }
+
+    send TEST_RUN_REQ { duration_s = 60 }
+
+    wait TEST_RUN_CNF
+
+    log_stop
+
+ 
+
+    # --- Verify ARQ behaviour ---------------------------------------------
+
+    expect RLC_STATUS_PDU_IND { ue_id = 1 ; contains = NACK_SN }
+
+    measure rlc_retransmission_count
+
+    measure rlc_status_pdu_count
+
+    measure sdu_loss_count          ;# PASS criterion: == 0
+
+    measure rlc_reordering_ok       ;# in-order delivery to PDCP
+
+    measure residual_bler_post_arq
+
+ 
+
+    # PASS: 0 SDU loss, correct NACK->retx, no RLF (errors < max_retx_threshold)
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# TC-03  HARQ RETRANSMISSION & BLER TARGET VERIFICATION
+
+#   Goal: moderate SINR -> verify ~10% initial BLER + HARQ recovery (<1% resid)
+
+###############################################################################
+
+proc TC03_harq_bler_target {} {
+
+    tc_common_setup
+
+ 
+
+    # --- Override RF to a controlled moderate SINR ------------------------
+
+    send RF_CONDITION_REQ {
+
+        path_loss_db   = 95
+
+        fading_profile = EPA5           ;# example fading model
+
+        target_sinr_db = 10
+
+    }
+
+    wait RF_CONDITION_CNF
+
+ 
+
+    send UE_CONFIG_REQ {
+
+        num_ues          = 1
+
+        mimo_layers_dl   = 2
+
+        max_modulation   = 256QAM
+
+    }
+
+    wait UE_CONFIG_CNF
+
+ 
+
+    send HARQ_CONFIG_REQ {
+
+        ue_id            = 1
+
+        max_harq_tx      = 4
+
+        combining        = INCREMENTAL_REDUNDANCY
+
+    }
+
+    wait HARQ_CONFIG_CNF
+
+ 
+
+    send UE_ATTACH_REQ { ue_id = 1 }
+
+    expect DRB_ESTABLISHED_IND { ue_id = 1 ; drb_id = 1 }
+
+ 
+
+    send DATA_FLOW_REQ {
+
+        ue_id      = 1
+
+        direction  = DL
+
+        traffic    = FULL_BUFFER
+
+    }
+
+    wait DATA_FLOW_CNF
+
+ 
+
+    log_start { layers = {MAC} ; ue_id = 1 ; harq_detail = on }
+
+    send TEST_RUN_REQ { duration_s = 120 }
+
+    wait TEST_RUN_CNF
+
+    log_stop
+
+ 
+
+    measure initial_bler_dl          ;# PASS window: ~8-12%
+
+    measure residual_bler_dl         ;# PASS: < 1%
+
+    measure harq_retx_distribution
+
+    measure mcs_distribution_dl
+
+    measure mac_dl_throughput_mbps
+
+ 
+
+    # PASS: initial BLER in target window, residual < 1%, IR combining gain seen
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# TC-04  LOGICAL CHANNEL PRIORITIZATION (LCP) & MAC MULTIPLEXING (UL)
+
+#   Goal: 2+ logical channels, differing priority -> verify LCP order + BSR.
+
+###############################################################################
+
+proc TC04_lcp_mac_multiplexing {} {
+
+    tc_common_setup
+
+ 
+
+    send UE_CONFIG_REQ { num_ues = 1 }
+
+    wait UE_CONFIG_CNF
+
+ 
+
+    # --- Two logical channels with distinct priority + PBR ----------------
+
+    send LOGICAL_CHANNEL_CONFIG_REQ {
+
+        ue_id          = 1
+
+        lcid           = 4
+
+        priority       = 1              ;# higher priority (lower value)
+
+        pbr_kbps       = 64
+
+        bucket_size_ms = 100
+
+    }
+
+    wait LOGICAL_CHANNEL_CONFIG_CNF
+
+ 
+
+    send LOGICAL_CHANNEL_CONFIG_REQ {
+
+        ue_id          = 1
+
+        lcid           = 5
+
+        priority       = 8              ;# lower priority / best effort
+
+        pbr_kbps       = infinity
+
+        bucket_size_ms = 100
+
+    }
+
+    wait LOGICAL_CHANNEL_CONFIG_CNF
+
+ 
+
+    send UE_ATTACH_REQ { ue_id = 1 }
+
+    expect RRC_CONNECTED_IND { ue_id = 1 }
+
+ 
+
+    # --- Simultaneous UL traffic on both LCs ------------------------------
+
+    send DATA_FLOW_REQ { ue_id = 1 ; direction = UL ; lcid = 4 ; rate_mbps = 20 }
+
+    send DATA_FLOW_REQ { ue_id = 1 ; direction = UL ; lcid = 5 ; rate_mbps = 20 }
+
+    wait DATA_FLOW_CNF
+
+ 
+
+    log_start { layers = {MAC} ; ue_id = 1 ; pdu_composition = on }
+
+    send TEST_RUN_REQ { duration_s = 60 }
+
+    wait TEST_RUN_CNF
+
+    log_stop
+
+ 
+
+    # --- Verify multiplexing follows LCP rules ----------------------------
+
+    expect BSR_IND { ue_id = 1 }
+
+    measure per_lc_throughput        ;# LCID4 served to PBR before LCID5
+
+    measure mac_pdu_composition      ;# correct LCID subheaders/order
+
+    measure bsr_accuracy
+
+ 
+
+    # PASS: high-prio LC filled to PBR first, correct LCID mapping, accurate BSR
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# TC-05  RLC SEGMENTATION/REASSEMBLY + CARRIER AGGREGATION THROUGHPUT
+
+#   Goal: small grants force RLC segmentation; CA aggregate thpt scales.
+
+###############################################################################
+
+proc TC05_segmentation_and_ca {} {
+
+    tc_common_setup
+
+ 
+
+    # --- Multi-carrier UE -------------------------------------------------
+
+    send UE_CONFIG_REQ {
+
+        num_ues          = 1
+
+        mimo_layers_dl   = 4
+
+        max_modulation   = 256QAM
+
+        ca_num_cc        = 2            ;# PCell + 1 SCell
+
+    }
+
+    wait UE_CONFIG_CNF
+
+ 
+
+    send SCELL_CONFIG_REQ {
+
+        ue_id   = 1
+
+        scell_id = 1
+
+        band     = n78
+
+        bw_mhz   = 100
+
+    }
+
+    wait SCELL_CONFIG_CNF
+
+ 
+
+    send RLC_CONFIG_REQ { ue_id = 1 ; mode = AM ; sn_field_length = 18 }
+
+    wait RLC_CONFIG_CNF
+
+ 
+
+    send UE_ATTACH_REQ { ue_id = 1 }
+
+    expect DRB_ESTABLISHED_IND { ue_id = 1 ; drb_id = 1 }
+
+ 
+
+    # --- Activate SCell via MAC CE ----------------------------------------
+
+    send SCELL_ACTIVATE_REQ { ue_id = 1 ; scell_id = 1 }
+
+    expect SCELL_ACTIVATED_IND { ue_id = 1 ; scell_id = 1 }
+
+ 
+
+    # --- Large SDUs + constrained grants -> force segmentation ------------
+
+    send DATA_FLOW_REQ {
+
+        ue_id          = 1
+
+        direction      = DL
+
+        traffic        = FULL_BUFFER
+
+        sdu_size_bytes = 9000          ;# large SDU
+
+        l2_mode        = AM
+
+    }
+
+    send GRANT_CONSTRAINT_REQ { ue_id = 1 ; max_tb_bytes = 1500 }  ;# < SDU => seg
+
+    wait DATA_FLOW_CNF
+
+ 
+
+    log_start { layers = {MAC, RLC, PDCP} ; ue_id = 1 }
+
+    send TEST_RUN_REQ { duration_s = 60 }
+
+    wait TEST_RUN_CNF
+
+    log_stop
+
+ 
+
+    measure rlc_segmentation_count   ;# SI/SO usage observed
+
+    measure sdu_integrity            ;# PASS: 0 corruption/loss after reassembly
+
+    measure agg_dl_throughput_mbps   ;# ~ sum of PCell + SCell
+
+    measure per_cc_throughput
+
+    measure pdcp_reordering_ok       ;# in-order despite out-of-order RLC
+
+    measure scell_activation_time_ms
+
+ 
+
+    # PASS: correct seg/reassembly, 0 SDU loss, CA thpt ~= sum of carriers
+
+}
+
+ 
+
+ 
+
+###############################################################################
+
+# RUNNER
+
+###############################################################################
+
+proc run_all_l2_tests {} {
+
+    TC01_dl_peak_throughput
+
+    TC02_rlc_am_retransmission
+
+    TC03_harq_bler_target
+
+    TC04_lcp_mac_multiplexing
+
+    TC05_segmentation_and_ca
+
+}
+
+ 
+
+# run_all_l2_tests
+
+ 
+
+
+
+Here's a tight interview crib sheet — the crispest accurate version of each topic, the way you'd actually say it out loud. One or two sentences each.
+RLC Retransmission
+RLC retransmission happens only in AM (Acknowledged Mode) via ARQ. The receiver sends a STATUS PDU with ACK_SN and NACK_SN; the sender retransmits the NACKed PDUs (re-segmenting with SO/SI if the grant is smaller). It's triggered by a NACK or by t-PollRetransmit expiry after a poll. If retransmissions hit maxRetxThreshold, RLC tells RRC, which declares Radio Link Failure.
+Why RLC ARQ if HARQ exists? HARQ is fast but its 1-bit ACK/NACK can be misread (~10⁻³), leaving residual errors; RLC ARQ uses richer STATUS feedback to clean those up, getting BLER down to ~10⁻⁶.
+TCP vs UDP
+TCP is connection-oriented, reliable, ordered, with flow and congestion control — used for web, email, file transfer. UDP is connectionless, unreliable, low-overhead (8-byte header) — used for VoIP, streaming, DNS, gaming. The trade-off is reliability vs latency.
+5G Throughput Calculation
+Throughput = Σ (layers × Qm × code rate × RE/sec × (1−overhead)) per carrier. RE/sec = N_PRB × 12 / symbol duration. Example: 100 MHz, 30 kHz, 4 layers, 256QAM ≈ 2.34 Gbps DL. You scale up with carrier aggregation, more MIMO layers, or FR2 bandwidth.
+MCS & SINR Mapping
+SINR sets the highest reliable MCS (modulation order Qm × code rate). UE reports CQI (0–15) derived from SINR; gNB maps it to an MCS targeting ~10% initial BLER. Low SINR → QPSK low rate; high SINR → 256QAM high rate — a 20×+ throughput swing on the same resources.
+TDD Frame Structure
+10 ms frame = 10 subframes; each subframe = 2^μ slots; each slot = 14 symbols. Slots are Downlink, Uplink, or Special (the special slot has DL symbols + guard period + UL symbols). Pattern like DDDSU sets the DL:UL ratio, so effective DL throughput = peak × DL-slot fraction (~70–80%).
+Carrier Aggregation
+Combines multiple component carriers to give a UE more bandwidth; total throughput = sum of carriers. PCell handles signaling/mobility (always present); SCells are added/removed via MAC CE for extra capacity. Differs from Dual Connectivity, which uses two nodes with separate MAC entities (EN-DC in NSA 5G).
+Link Adaptation
+Continuously matches modulation, code rate, MIMO rank, and power to channel quality. Inner loop maps CQI → MCS (fast); outer loop (OLLA) applies an SINR offset from HARQ ACK/NACK history to hold the ~10% BLER target. Targets 10% (not 0%) because HARQ cheaply recovers the rest, maximizing net throughput.
+Cell & UE KPIs
+RF metrics: RSRP = signal strength (dBm, good ≥ −90), RSRQ = quality incl. interference/load (dB), SINR = signal vs interference+noise (predicts throughput, good ≥ 13 dB). Network KPI families: Accessibility (setup success), Retainability (drop rate), Mobility (handover success), Integrity (throughput/latency/BLER), Availability (cell uptime). Key insight: strong RSRP + poor SINR = full bars but slow data (interference).
+Low Throughput Troubleshooting
+First scope it: one user or whole cell? Then funnel down: RF (low SINR → low MCS), high BLER/retransmissions, congestion (high PRB utilization), config gaps (CA/256QAM/MIMO not enabled), transport/backhaul ceiling, then core/device/server. Remember TCP throughput ≈ window/RTT, so latency can cap it even on a fast radio.
+VoNR KPIs
+VoNR is native 5G voice on IMS, voice media on 5QI=1 (GBR), signaling on 5QI=5, using the EVS codec. Quality KPIs are about delay, jitter, packet loss, and MOS — not throughput (one-way delay < 150 ms, MOS > 3.5 good). EPS Fallback (redirect voice to LTE) success/delay is a key VoNR-era KPI.
+TM500 L2 Testing
+TM500 is a UE emulator used to load- and protocol-test the gNB/eNB. For L2 you test MAC scheduling/throughput, HARQ BLER target, RLC AM ARQ (with induced errors), MAC LCP/multiplexing/BSR, and RLC segmentation + CA. You isolate MAC vs RLC vs PDCP faults using the per-layer logs/counters.
+
+A few likely rapid-fire follow-ups worth having ready:
+* Difference between HARQ and ARQ? HARQ = fast MAC-layer, stop-and-wait, soft combining; ARQ = slower RLC-layer, STATUS-based, reliable cleanup.
+* Why DNS over UDP? Tiny query/response, handshake overhead would dominate; falls back to TCP for large responses.
+* Why 10% BLER target? HARQ recovers it cheaply; maximizes net throughput vs a conservative near-zero target.
+* Strong signal but slow data? Interference — good RSRP, poor SINR/RSRQ.
+Want me to turn this into a one-page study sheet file you can keep, or run a quick mock Q&A where I fire questions and you practice answers?
+
+
+
+qstn can be on basic things too, like sinr, rsrp etc, define these can be asked qstns
+
+
+Here are crisp, say-it-out-loud definitions for the basic terms — the kind you should be able to rattle off instantly.
+RSRP (Reference Signal Received Power) — The average power received on the reference signal resource elements, in dBm. It's a pure measure of signal strength/coverage. Good ≥ −90 dBm, cell edge around −110 dBm.
+RSRQ (Reference Signal Received Quality) — Signal quality, defined as RSRQ = N × RSRP / RSSI (N = number of PRBs), in dB. It factors in interference and cell load, not just strength. Good ≥ −10 dB.
+RSSI (Received Signal Strength Indicator) — Total wideband received power: wanted signal + interference + noise across all RBs, in dBm. Used inside the RSRQ formula.
+SINR (Signal-to-Interference-plus-Noise Ratio) — Ratio of wanted signal power to interference + noise, in dB. It's the best predictor of throughput because it sets the achievable MCS. Good ≥ 13 dB; excellent ≥ 20 dB.
+CQI (Channel Quality Indicator) — A 4-bit value (0–15) the UE reports indicating the highest modulation + code rate it can decode at ~10% BLER. Higher = better channel. The gNB maps it to an MCS.
+RI (Rank Indicator) — The number of MIMO layers (spatial streams) the channel can support, reported by the UE. Higher rank = more parallel data streams = more throughput.
+PMI (Precoding Matrix Indicator) — The UE's recommended precoder/beam from the codebook that best matches the channel for MIMO.
+MCS (Modulation and Coding Scheme) — An index bundling modulation order (QPSK/16/64/256QAM) and code rate. The gNB picks it per user based on CQI; higher MCS = more bits/symbol but needs better SINR.
+PRB (Physical Resource Block) — The smallest schedulable frequency unit: 12 subcarriers wide. The amount of bandwidth a user gets is counted in PRBs.
+BLER (Block Error Rate) — Fraction of transport blocks received in error. Link adaptation targets ~10% initial BLER; residual after HARQ should be < 1%.
+HARQ (Hybrid ARQ) — Fast MAC-layer retransmission with soft combining (Chase/Incremental Redundancy), using 1-bit ACK/NACK. Recovers errors quickly; typically up to ~4 attempts.
+ARQ — Slower, reliable RLC-layer retransmission using STATUS PDUs (ACK_SN/NACK_SN). Cleans up residual errors HARQ misses.
+Throughput — Actual data rate delivered (Mbps/Gbps). Driven by bandwidth (PRBs) × MIMO layers × MCS × (1−overhead), minus retransmissions and scheduling share.
+MIMO (Multiple-Input Multiple-Output) — Using multiple antennas to send several spatial streams (layers) in parallel on the same time-frequency resources, multiplying throughput.
+Beamforming — Steering antenna energy directionally toward a user to boost signal (and SINR) and reduce interference. Critical at mmWave/FR2.
+Numerology (μ) — The subcarrier spacing setting in 5G: μ=0 → 15 kHz, μ=1 → 30 kHz, etc. Higher μ = wider subcarriers, shorter slots, lower latency.
+PDCP / RLC / MAC / PHY — The L2/L1 stack: PDCP (ciphering, reordering, header compression), RLC (segmentation, ARQ retransmission), MAC (scheduling, HARQ, multiplexing), PHY (actual transmission).
+RRC states — IDLE (no connection, camped), CONNECTED (active data/signaling), and in 5G INACTIVE (connection suspended for fast resume, saves battery + signaling).
+Handover (HO) — Moving an active connection from one cell to another as the UE moves, without dropping the call/session. Target success rate > 98%.
+QoS / 5QI — 5G QoS Identifier mapping a flow to treatment rules (priority, delay budget, GBR vs non-GBR). E.g. 5QI=1 = voice (GBR, delay-critical).
+
+A common interview move is the compare-and-contrast version of these — be ready for:
+* RSRP vs RSRQ vs SINR? Strength vs quality vs throughput-predictor.
+* RSRP vs RSSI? RSRP is per-RE reference signal power only; RSSI is total wideband power including interference and noise.
+* CQI vs MCS? CQI is the UE's recommendation; MCS is what the gNB actually schedules.
+* HARQ vs ARQ? Fast MAC vs reliable RLC retransmission.
+Want me to drill you with rapid-fire "define X" questions so you can practice answering cold?
+
+Rmax- 948/1024. Max LDPC code rate
+
+
+
+
+
+
+
+
+
+ 
