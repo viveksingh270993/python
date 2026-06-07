@@ -1,14 +1,40 @@
-l1 = ["apple", "banana", "apple", "cherry", "banana", "apple", "date", "cherry", "banana", "date"]
-unique_list = list(set(l1))
-l = len(l1)
-k = 0
-count = 0
-values = []
-for i in unique_list:
-    while k<l:
-        if i == l1[k]:
-            count+=1
-        k+=1
-    values.append(count)
+# l1 = ["apple", "banana", "apple", "cherry", "banana", "apple", "date", "cherry", "banana", "date"]
+# unique_list = list(set(l1))
+# l = len(l1)
+# k = 0
+# count = 0
+# values = []
+# for i in unique_list:
+#     while k<l:
+#         if i == l1[k]:
+#             count+=1
+#         k+=1
+#     values.append(count)
 
-print(dict(zip(unique_list, values)))
+# print(dict(zip(unique_list, values)))
+
+a = [1, 2, 3, 4, 5]
+a.append(9)
+print(a)
+a.extend([6, 7, 8])
+print(a)
+a.insert(0, 7)
+print(a)
+a.remove(7)
+print(a)
+a.pop(6)
+print(a)
+a.pop()
+print(a)
+a.sort()
+print(a)
+a.reverse()
+print(a)
+a.clear()
+print(a)
+b = list(map(int, input("Enter the list: ").split()))
+print(b)
+c = set(map(int, input("Enter the set: ").split()))
+print(c)
+d = tuple(map(int, input("Enter the tuple: ").split()))
+print(d)
