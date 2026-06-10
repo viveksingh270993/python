@@ -13,28 +13,131 @@
 
 # print(dict(zip(unique_list, values)))
 
-a = [1, 2, 3, 4, 5]
-a.append(9)
-print(a)
-a.extend([6, 7, 8])
-print(a)
-a.insert(0, 7)
-print(a)
-a.remove(7)
-print(a)
-a.pop(6)
-print(a)
-a.pop()
-print(a)
-a.sort()
-print(a)
-a.reverse()
-print(a)
-a.clear()
-print(a)
-b = list(map(int, input("Enter the list: ").split()))
-print(b)
-c = set(map(int, input("Enter the set: ").split()))
-print(c)
-d = tuple(map(int, input("Enter the tuple: ").split()))
-print(d)
+# a = [1, 2, 3, 4, 5]
+# a.append(9)
+# print(a)
+# a.extend([6, 7, 8])
+# print(a)
+# a.insert(0, 7)
+# print(a)
+# a.remove(7)
+# print(a)
+# a.pop(6)
+# print(a)
+# a.pop()
+# print(a)
+# a.sort()
+# print(a)
+# a.reverse()
+# print(a)
+# a.clear()
+# print(a)
+# b = list(map(int, input("Enter the list: ").split()))
+# print(b)
+# c = set(map(int, input("Enter the set: ").split()))
+# print(c)
+# d = tuple(map(int, input("Enter the tuple: ").split()))
+# print(d)
+
+# a = [1, 2, 3, 4, 5]
+# a.remove(4)
+# print(a)
+# a.pop(2)
+# print(a)
+# a.pop()
+# print(a)
+# a.append(6)
+# print(a)
+# a.extend([7, 8, 9])
+# print(a)
+# a.insert(0, 0)
+# print(a)
+# a.sort()
+# print(a)
+# a.reverse()
+# print(a)
+# a.clear()
+# print(a)
+
+# d = {"name": "Alice", "age": 30, "city": "New York"}
+# print(d)
+# d["age"] = 31
+# print(d)
+# d["country"] = "USA"
+# print(d)
+# del d["city"]
+# print(d)
+# print(d.keys())
+# print(d.values())
+# print(d.items())    
+# print(d.get("nam")) #None
+# print(d.get("nam", "Not found")) #Not found
+# print(d["nam"])  #KeyError  
+
+# a = [1, 2, 3, 4, 5, 3, 2, 1, 7, 7, 6, 9, 10]
+# unique_list = list(set(a))
+# l = len(a)
+# k = 0
+# count = 0
+# values = []
+# for i in a:
+#     if i not in values:
+#         values.append(i)
+# print(values)
+# print(unique_list)     
+# l = list(map(int, input("Enter the list: ").split()))
+# freq = {}
+# for i in l :
+#    freq[i] = freq.get(i, 0)+1
+# print(max(freq.items()))   
+# print(max(freq.values()))
+# print(max(freq, key=freq.get))
+# print(max(freq))
+# print(freq)
+# l =list(map(str, input("Enter the dictionary keys: ").split()))
+# v = list(map(str, input("Enter the dictionary values: ").split()))
+# d = dict(zip(l,v))
+# print(d)
+# result = {}
+# for key, value in d.items():
+#     result.setdefault(value, []).append(key)
+#print(result)
+
+# a = {}
+# print(type(a))
+# c = set()
+# print(type(c))
+# e = dict()
+# print(type(e))
+# f = list()
+# print(type(f))
+# g = tuple()
+# print(type(g))
+# h = []
+# print(type(h))
+# i = ()
+# print(type(i))
+# d = [1, 2, 3]
+# for i, k in enumerate(d):
+#     print(i, k) 
+
+# def to_uppercase(s):
+#     res = ""
+#     for i in s:
+#         if "a" <= i <= "z":
+#             res+= chr(ord(i)-32)
+#         else:
+#             res+= i
+#     return res
+# print(to_uppercase(input("enter the string: ")))
+# def index_of_nonrepeating_char(s):
+#     char_count = {}
+#     for char in s:
+#         char_count[char] = char_count.get(char, 0) +1
+#     for char in s:
+#         if char_count[char] == 1:
+#             return s.index(char)
+    
+# print(index_of_nonrepeating_char(input("enter the string: ")))
+
+    
