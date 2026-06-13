@@ -242,5 +242,44 @@
 #         curMin = min(tmp, curMin*i, i)
 #         print(curMax, curMin, res)
 #         res = max(curMax, curMin, res)
-#     return max(res, curMax)    
+#     return res   
 # print(maxproductsubarray([1, 2, -3, 4, -6, 0, 3]))
+# def min_rotated_sorted_array(arr):
+#     l, r = 0, len(arr)-1
+#     res = arr[0]
+#     while l<=r:
+#         if arr[l]<arr[r]:
+#             res = min(res, arr[l])
+#             break
+        
+#         m = (l+r)//2
+#         res = min(res, arr[m])
+#         if arr[m]>arr[l]:
+#             l = m+1
+#         else:
+#             r = m-1
+#     return res        
+# l = [2, 3, 4, 5, 6, 0, 1]     
+# print(min_rotated_sorted_array(l))            
+# def search_rotated_sorted_array(arr, target):
+#     l, r = 0, len(arr)-1
+#     while l <= r:
+#         mid = (l+r)//2
+#         if target == arr[mid]:
+#             return mid
+#         #left sorted portion
+#         if arr[l]<=arr[mid]:
+#             if arr[mid] < target or arr[l] > target:
+#                 l = mid + 1
+#             else:
+#                 r = mid - 1
+#         #right sorted portion
+#         else:
+#             if target < arr[mid] or arr[r]<target:
+#                 r = mid - 1
+#             else:
+#                 l = mid + 1          
+#     return -1           
+# print(search_rotated_sorted_array([4, 5, 6, 7, 8, 1, 2, 3], 3))
+     
+    
