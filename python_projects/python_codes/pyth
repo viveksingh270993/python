@@ -139,5 +139,10 @@
 #             return s.index(char)
     
 # print(index_of_nonrepeating_char(input("enter the string: ")))
-
+# astr = 'Hello Bob'
+# istr = int(astr)
+# print('First', istr)
+# astr = '123'
+# istr = int(astr)
+# print('Second', istr)
     
