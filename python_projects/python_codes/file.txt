@@ -5,7 +5,7 @@ Claude finished the response
 
 rlc retransmission----in as much depth as possible also possible interview questions and answers on it, no pdf
 
-
+Registration Reject
 RLC Retransmission — Deep Dive
 1. Where RLC Sits
 RLC (Radio Link Control) is a Layer-2 sublayer in the LTE and 5G NR user-plane and control-plane stack:

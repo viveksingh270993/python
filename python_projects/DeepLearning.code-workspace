@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../DeepLearning"
+		},
+		{
+			"name": "python",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

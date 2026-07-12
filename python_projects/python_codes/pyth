@@ -281,6 +281,76 @@
 #                 l = mid + 1          
 #     return -1           
 # print(search_rotated_sorted_array([4, 5, 6, 7, 8, 1, 2, 3], 3))
+# def threesum(arr):
+#     res = []
+#     arr.sort()
+#     for i, n in enumerate(arr):
+#         if i>0 and arr[i-1] == n:
+#             continue
+#         l, r = i+1, len(arr)-1
+#         while l <r:
+#             threeSum = n + arr[l] + arr[r]
+#             if threeSum < 0:
+#                 l +=1
+#             elif threeSum > 0:
+#                 r -=1
+#             else:
+#                 res.append([n, arr[l], arr[r]])
+#                 l += 1
+#                 while arr[l] == arr[l-1] and l<r:
+#                     l += 1
+#     return res            
+                        
+# print(threesum([-2, -2, 0, 0, 2, 2, -1, -3, 1]))
+# def container_with_most_water(height):
+#         res = 0
+#         l, r = 0, len(height) - 1
+#         while l < r:
+#             area = (r-l) * (min(height[l], height[r]))
+#             res = max(res, area)
+#             if height[l]> height[r]:
+#                   r -= 1
+#             else:
+#                   l += 1
+#         return res
 
-     
-    
+# print (container_with_most_water([1, 8, 6, 2, 5, 4, 8, 3, 7]))               
+                
+# def hamming_weight(n):
+#     res = 0
+#     while n:
+#         res += n%2
+#         n = n >> 1
+#     return res   
+# print(hamming_weight(4)) 
+# def hammingweight(n):
+#     res = 0
+#     while n:
+#         n = n & n-1
+#         res += 1
+#     return res
+# print(hammingweight(9))
+
+
+
+
+
+
+
+
+
+
+
+
+with open('file.txt', 'r') as f:
+    a = f.read().split()
+    success_count = 0
+    failure_count = 0
+    print(a)
+    for i in range(len(a)):
+        if "Registration Accept" in a:
+            success_count += 1
+        elif "Registration Reject" in a:
+            failure_count += 1   
+    print("success count is :", success_count)
+    print("failure count is: ", failure_count)
